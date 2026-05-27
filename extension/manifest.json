@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Whisper Dictate",
+  "version": "1.0",
+  "description": "Receives transcribed text from Whisper Dictate and types it via CDP.",
+  "permissions": ["debugger", "tabs", "windows", "storage"],
+  "host_permissions": [
+    "http://localhost:9754/*",
+    "https://remotedesktop.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Whisper Dictate",
+    "default_popup": "popup.html"
+  }
+}

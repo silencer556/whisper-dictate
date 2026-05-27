@@ -1,0 +1,79 @@
+[hotkey]
+key = "win+`"                    # push-to-talk key
+mode = "push_to_talk"            # or "toggle"
+
+[whisper]
+model = "medium.en"              # tiny.en | base.en | small.en | medium.en | large-v3
+device = "cpu"                   # "cuda" requires cublas64_12.dll; fall back to "cpu" if unavailable
+compute_type = "int8"            # float16 for GPU, int8 for CPU
+initial_prompt = "VDCI, IANA, BIM101, Gaslamp, Old Town Transit Center"
+
+[audio]
+sample_rate = 16000
+channels = 1
+device_index = -1                # -1 = system default mic
+min_duration_sec = 0.3           # discard clips shorter than this
+silence_threshold_db = -50.0     # discard clips quieter than this (RMS dB)
+auto_stop_silence_sec = 1.5      # seconds of silence before auto-stop in continuous mode (0 = disabled)
+vad_threshold_db = -40.0         # dB level below which audio counts as silence for auto-stop
+
+[output]
+method = "extension"             # keystroke | clipboard | extension | remote
+                                 # extension = browser extension via CDP (works through Chrome Remote Desktop)
+keystroke_delay_ms = 10          # ms between each character; only used by "keystroke" method
+trailing_space = true
+sound_on_start = true
+sound_on_stop = true
+extension_port = 9754            # must match the port in the browser extension popup
+
+[remote]
+# To use: set method = "remote" above, fill in the Mac's local IP, then run on the Mac:
+#   python3 whisper_relay.py
+host = ""        # Mac's local network IP, e.g. "192.168.1.42"
+port = 9753
+
+# Vocabulary substitutions — applied after transcription in a single pass.
+# Matching is case-insensitive with word boundaries.
+# Longer keys always win over shorter ones, and [vocabulary.unique] is applied
+# before [vocabulary.terminology] and [vocabulary.names], so "at claire lee"
+# becomes "@claire lee" without then re-triggering the "claire lee" -> "Claire Lee" rule.
+
+# Punctuation you can call out by name.  The space before the symbol is stripped
+# automatically, so "how are you question mark" → "how are you?"
+# Unambiguous phrases are on by default.  Common English words are commented out —
+# uncomment them only if you rarely say them in normal speech.
+[vocabulary.punctuation]
+"question mark"     = "?"
+"exclamation point" = "!"
+"exclamation mark"  = "!"
+"full stop"         = "."
+"open paren"        = "("
+"open parenthesis"  = "("
+"close paren"       = ")"
+"close parenthesis" = ")"
+"dot dot dot"       = "..."
+"ellipsis"          = "..."
+"new paragraph"     = "\n\n"
+# "period"    = "."    # risky — common word
+# "comma"     = ","    # risky — common word
+# "colon"     = ":"
+# "semicolon" = ";"
+# "dash"      = "-"
+# "em dash"   = "—"
+
+[vocabulary.terminology]
+# Technical terms, abbreviations, acronyms.
+"vee dee see eye" = "VDCI"
+"vdci" = "VDCI"
+"bim one oh one" = "BIM101"
+"bim 101" = "BIM101"
+
+[vocabulary.names]
+# People, places, proper nouns.
+"old town transit" = "Old Town Transit Center"
+
+[vocabulary.unique]
+# Special conversions: Slack @mentions, #channels, symbols, URLs, etc.
+# Example: saying "at claire lee" types "@claire lee" for a Slack mention.
+# "at claire lee" = "@claire lee"
+# "hash channel general" = "#general"
