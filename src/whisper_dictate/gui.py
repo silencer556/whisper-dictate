@@ -632,7 +632,7 @@ class DictateGUI:
         self.root.after(0, lambda: self._end_recording(restart=True, beep=False))
 
     def _end_recording(self, restart: bool = False, beep: bool = False):
-        # Cancel streaming timer first to prevent a tick racing the final transcription
+        # Cancel the streaming timer immediately so no new tick starts
         if self._stream_timer is not None:
             self._stream_timer.cancel()
             self._stream_timer = None
@@ -641,17 +641,11 @@ class DictateGUI:
             if self._state != "recording":
                 return  # Guard against double-fire
 
-        # If a streaming tick is mid-transcription, wait briefly for it to finish
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            with self._stream_lock:
-                if not self._stream_busy:
-                    break
-            time.sleep(0.05)
-
-        stream_typed_snapshot = self._stream_typed   # capture before reset
-
+        # Stop the recorder right away so no extra silence is captured while
+        # we wait for any in-flight streaming tick to finish.
+        stream_typed_snapshot = self._stream_typed
         audio = self._recorder.stop()
+
         if beep:
             threading.Thread(target=_beep_stop, daemon=True).start()
         self._set_state("transcribing")
@@ -661,6 +655,16 @@ class DictateGUI:
         ).start()
 
     def _transcribe_worker(self, audio, restart_after: bool, stream_typed: str = ""):
+        # If a streaming tick is still running (race against end-of-recording), wait
+        # for it to finish before we start the final transcription.  This is safe here
+        # because we are already in a background thread — the main thread is never blocked.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            with self._stream_lock:
+                if not self._stream_busy:
+                    break
+            time.sleep(0.05)
+
         displayed: list[str] = []
         from .commands import find_command, run_action
 
@@ -668,12 +672,13 @@ class DictateGUI:
         _CONF_THRESHOLD = 0.75
         uncertain_seen: dict[str, float] = {}   # word -> lowest probability seen
 
-        # Track how much of the full transcript we've already accounted for via streaming.
-        # This lets us skip re-typing words that were already sent during the streaming ticks.
-        _stream_prefix_consumed = False   # True once we've skipped past the streamed portion
+        # Word-count-based streaming dedup: track how many words we've accumulated
+        # across all displayed segments so we know which words streaming already typed.
+        _display_word_count = 0
+        _words_streamed = len(stream_typed.split()) if stream_typed else 0
 
         def on_segment(raw: str, words=None):
-            nonlocal _stream_prefix_consumed
+            nonlocal _display_word_count
             if self._cancel_session:
                 return   # already cancelled — ignore remaining segments
             text = apply_substitutions(raw, self._vocab)
@@ -710,16 +715,27 @@ class DictateGUI:
             if text_to_type:
                 self._last_speech_time = time.monotonic()  # reset idle timer on real speech
 
-                # Skip words already typed by streaming ticks
-                actual_to_type = text_to_type
-                if stream_typed and not _stream_prefix_consumed:
-                    # Build the full text we have so far (what streaming typed + this segment)
-                    so_far = " ".join(displayed + [text_to_type]) if displayed else text_to_type
-                    actual_to_type = _words_after_prefix(stream_typed, so_far)
-                    # Once we've consumed the streamed prefix, stop checking
-                    if len(so_far.split()) >= len(stream_typed.split()):
-                        _stream_prefix_consumed = True
+                # Skip words already typed by streaming ticks using word-count dedup.
+                # This is more robust than sequential word matching because Whisper's
+                # final pass may transcribe words slightly differently from the streaming
+                # passes (different capitalisation, punctuation, contractions, etc.).
+                seg_words = text_to_type.split()
+                seg_word_count = len(seg_words)
+                seg_start = _display_word_count          # word index where this segment starts
+                seg_end   = _display_word_count + seg_word_count
 
+                if _words_streamed > 0 and seg_end <= _words_streamed:
+                    # Entire segment was already typed by streaming — skip typing
+                    actual_to_type = ""
+                elif _words_streamed > 0 and seg_start < _words_streamed:
+                    # Segment is partially covered — type only the tail
+                    skip = _words_streamed - seg_start
+                    actual_to_type = " ".join(seg_words[skip:])
+                else:
+                    # Streaming didn't cover this segment at all (or streaming was off)
+                    actual_to_type = text_to_type
+
+                _display_word_count += seg_word_count
                 displayed.append(text_to_type)
                 self.root.after(0, lambda t=" ".join(displayed): self._update_display(t))
                 if actual_to_type:

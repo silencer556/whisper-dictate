@@ -1,5 +1,6 @@
 import logging
 import math
+import re
 import threading
 import time
 from pathlib import Path
@@ -246,6 +247,11 @@ class Transcriber:
         parts = []
         for seg in segments:
             part = seg.text.strip()
+            if not part:
+                continue
+            # Strip Whisper's ellipsis hallucination tokens (generated at pauses/silence).
+            # re.sub first handles "..." variants; replace handles the Unicode ellipsis "…".
+            part = re.sub(r'\.{3,}', '', part).replace('…', '').strip()
             if not part:
                 continue
             part = fix_missing_periods(part)
