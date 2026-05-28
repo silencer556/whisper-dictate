@@ -69,8 +69,36 @@ def _flatten(vocab: dict) -> dict[str, str]:
     return flat
 
 
+# ---------------------------------------------------------------------------
+# Automatic @ mention rule
+# ---------------------------------------------------------------------------
+# "at Name" → "@Name" whenever the word after "at" starts with an uppercase
+# letter (i.e. Whisper recognised it as a proper noun).  This fires AFTER
+# explicit vocabulary substitutions so a user-defined entry always wins.
+#
+# Guards:
+#  • Requires a word boundary before "at" so "chat John" never matches.
+#  • Negative lookbehind on @ and / so already-converted "@foo" and URLs
+#    like "//at" are never touched again.
+#  • Only matches when the name starts with [A-Z] — lowercase words like
+#    "at the store", "at work", "at 3pm" are left alone.
+#  • Allows hyphenated names (Jean-Pierre) but stops at apostrophes so
+#    "at John's desk" becomes "@John's desk" cleanly.
+_AT_MENTION_RE = re.compile(
+    r'(?<![/@])\b[Aa]t\s+([A-Z][a-zA-Z-]*(?:\s+[A-Z][a-zA-Z-]*)*)'
+)
+
+
+def _apply_at_mentions(text: str) -> str:
+    result, n = _AT_MENTION_RE.subn(lambda m: '@' + m.group(1), text)
+    if n:
+        log.debug("at-mention rule: %d replacement(s)  %r → %r", n, text, result)
+    return result
+
+
 def apply_substitutions(text: str, vocab: dict) -> str:
-    """Apply vocabulary substitutions to *text* in a single regex pass.
+    """Apply vocabulary substitutions to *text* in a single regex pass, then
+    apply the automatic @ mention rule.
 
     A single pass means a replacement can never be matched again by another rule,
     so "at claire lee" -> "@claire lee" won't then re-trigger "claire lee" -> "Claire Lee".
@@ -78,42 +106,47 @@ def apply_substitutions(text: str, vocab: dict) -> str:
     Longer keys are tried before shorter ones (regex alternation, left-to-right).
     Matching is case-insensitive with word boundaries.
     """
-    if not text or not vocab:
+    if not text:
         return text
 
-    flat = _flatten(vocab)
-    if not flat:
-        return text
+    result = text
 
-    # Longest keys first — regex alternation picks the first match left-to-right,
-    # so putting longer patterns earlier gives us longest-match behaviour.
-    sorted_keys = sorted(flat.keys(), key=len, reverse=True)
-    lookup = {k.lower(): v for k, v in flat.items()}
+    if vocab:
+        flat = _flatten(vocab)
+        if flat:
+            # Longest keys first — regex alternation picks the first match
+            # left-to-right, so putting longer patterns earlier gives us
+            # longest-match behaviour.
+            sorted_keys = sorted(flat.keys(), key=len, reverse=True)
+            lookup = {k.lower(): v for k, v in flat.items()}
 
-    patterns = [r"\b" + re.escape(k) + r"\b" for k in sorted_keys]
-    combined = re.compile("|".join(patterns), re.IGNORECASE)
+            patterns = [r"\b" + re.escape(k) + r"\b" for k in sorted_keys]
+            combined = re.compile("|".join(patterns), re.IGNORECASE)
 
-    applied: list[tuple[str, str]] = []
+            applied: list[tuple[str, str]] = []
 
-    def _replace(m: re.Match) -> str:
-        original = m.group()
-        replacement = lookup.get(original.lower(), original)
-        if replacement != original:
-            applied.append((original, replacement))
-        return replacement
+            def _replace(m: re.Match) -> str:
+                original = m.group()
+                replacement = lookup.get(original.lower(), original)
+                if replacement != original:
+                    applied.append((original, replacement))
+                return replacement
 
-    result = combined.sub(_replace, text)
+            result = combined.sub(_replace, result)
 
-    if applied:
-        log.debug("Vocabulary substitutions: %s", applied)
-        # Strip any space that was left immediately before a punctuation mark
-        # (e.g. "how are you ?" → "how are you?").  Only runs when something
-        # was actually substituted, so normal text is never touched.
-        result = re.sub(r' ([.!?,;:])', r'\1', result)
-        # Remove any comma or semicolon immediately followed by a stronger
-        # punctuation mark (e.g. ",!" → "!" or ",?" → "?").  Whisper sometimes
-        # inserts a comma before a spoken punctuation word like "exclamation mark"
-        # and the two end up adjacent after substitution.
-        result = re.sub(r'[,;]([.!?])', r'\1', result)
+            if applied:
+                log.debug("Vocabulary substitutions: %s", applied)
+                # Strip any space that was left immediately before a punctuation mark
+                # (e.g. "how are you ?" → "how are you?").  Only runs when something
+                # was actually substituted, so normal text is never touched.
+                result = re.sub(r' ([.!?,;:])', r'\1', result)
+                # Remove any comma or semicolon immediately followed by a stronger
+                # punctuation mark (e.g. ",!" → "!" or ",?" → "?").  Whisper sometimes
+                # inserts a comma before a spoken punctuation word like "exclamation mark"
+                # and the two end up adjacent after substitution.
+                result = re.sub(r'[,;]([.!?])', r'\1', result)
+
+    # Automatic @ mention rule runs last so explicit vocab entries take priority.
+    result = _apply_at_mentions(result)
 
     return result
