@@ -69,6 +69,7 @@ class Transcriber:
         self._model = None
         self._model_lock = threading.Lock()
         self._load_failed = False
+        self._last_word_end_sec: float = 0.0   # end-time of last word in most recent transcription
 
     # ------------------------------------------------------------------
     # Model loading
@@ -187,21 +188,33 @@ class Transcriber:
     # ------------------------------------------------------------------
 
     def transcribe(self, audio: np.ndarray, sample_rate: int,
-                   on_segment: callable = None) -> str:
+                   on_segment: callable = None,
+                   initial_prompt_override: str | None = None,
+                   min_duration_override: float | None = None,
+                   silence_threshold_override: float | None = None) -> str:
         """
         Transcribe float32 mono audio. Returns the text string, or GATED ("") if
         the clip was too short or too quiet. Raises on model load failure.
+
+        initial_prompt_override — if provided, used instead of the configured
+            initial_prompt.  Pass the previous streaming text to give Whisper
+            context so it doesn't repeat words at chunk boundaries.
+        min_duration_override / silence_threshold_override — per-call gate
+            overrides (e.g. stricter thresholds for short streaming chunks).
         """
+        min_dur = min_duration_override if min_duration_override is not None else self._min_duration_sec
+        sil_db  = silence_threshold_override if silence_threshold_override is not None else self._silence_threshold_db
+
         # Gate: duration
         duration = len(audio) / sample_rate if sample_rate > 0 else 0
-        if duration < self._min_duration_sec:
-            log.debug("Clip too short (%.3fs < %.3fs) — gated", duration, self._min_duration_sec)
+        if duration < min_dur:
+            log.debug("Clip too short (%.3fs < %.3fs) — gated", duration, min_dur)
             return GATED
 
         # Gate: silence
         db = _rms_db(audio)
-        if db < self._silence_threshold_db:
-            log.debug("Clip too quiet (%.1f dB < %.1f dB) — gated", db, self._silence_threshold_db)
+        if db < sil_db:
+            log.debug("Clip too quiet (%.1f dB < %.1f dB) — gated", db, sil_db)
             return GATED
 
         # Lazy load
@@ -214,8 +227,10 @@ class Transcriber:
 
         log.debug("Transcribing %.2fs clip (%.1f dB)…", duration, db)
 
+        prompt = initial_prompt_override if initial_prompt_override is not None else self._initial_prompt
+
         try:
-            return self._run_transcribe(audio, duration, on_segment)
+            return self._run_transcribe(audio, duration, on_segment, prompt)
         except RuntimeError as exc:
             if self._device == "cuda" and any(k in str(exc).lower() for k in ("cublas", "cuda", "cublaslt")):
                 log.warning("CUDA inference failed (%s) — falling back to CPU/int8", exc)
@@ -226,17 +241,18 @@ class Transcriber:
                     self._load_model()
                 if self._load_failed or self._model is None:
                     raise RuntimeError("CPU fallback model failed to load") from exc
-                return self._run_transcribe(audio, duration, on_segment)
+                return self._run_transcribe(audio, duration, on_segment, prompt)
             raise
 
     def _run_transcribe(self, audio: np.ndarray, duration: float,
-                        on_segment: callable = None) -> str:
+                        on_segment: callable = None,
+                        initial_prompt: str | None = None) -> str:
         t0 = time.monotonic()
 
         segments, info = self._model.transcribe(
             audio,
             language="en",
-            initial_prompt=self._initial_prompt,
+            initial_prompt=initial_prompt,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
             word_timestamps=True,
@@ -245,6 +261,8 @@ class Transcriber:
         from .vocabulary import fix_missing_periods
 
         parts = []
+        last_word_end_sec: float = 0.0   # end-time of the last word in the chunk (seconds)
+
         for seg in segments:
             part = seg.text.strip()
             if not part:
@@ -256,12 +274,19 @@ class Transcriber:
                 continue
             part = fix_missing_periods(part)
             parts.append(part)
+
+            # Track end-time of the last word so callers can advance sample pointers
+            # to the actual end of speech rather than the end of the audio buffer.
+            if seg.words:
+                last_word_end_sec = max(last_word_end_sec, seg.words[-1].end)
+
             if on_segment:
                 # words: list of (word_text, probability) — stripped of surrounding spaces
-                words = [(w.word.strip(), w.probability) for w in (seg.words or [])]
+                words = [(w.word.strip(), w.probability) for w in seg.words or []]
                 on_segment(part, words)
 
         text = " ".join(parts)
+        self._last_word_end_sec = last_word_end_sec   # stored for callers that need it
 
         elapsed = time.monotonic() - t0
         log.info(

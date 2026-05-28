@@ -577,8 +577,12 @@ class DictateGUI:
                 chunk = full_audio[offset:]
 
                 chunk_dur = len(chunk) / self._sample_rate if self._sample_rate else 0
-                min_dur = max(0.5, self._stream_interval_sec * 0.3)
-                log.info("Stream tick: chunk=%.1fs (offset=%d)", chunk_dur, offset)
+                # Require at least 1.5 s of new audio.  Very short chunks are more prone
+                # to Whisper hallucinations (e.g. "Thanks for watching") triggered by
+                # quiet background audio barely above the silence gate.
+                min_dur = max(1.5, self._stream_interval_sec * 0.5)
+                log.info("Stream tick: chunk=%.1fs (offset=%d, min=%.1fs)",
+                         chunk_dur, offset, min_dur)
                 if chunk_dur < min_dur:
                     return   # not enough new audio in this chunk yet
 
@@ -589,7 +593,17 @@ class DictateGUI:
                     if text:
                         parts.append(text)
 
-                self._transcriber.transcribe(chunk, self._sample_rate, on_segment=_on_seg)
+                # Pass the previously streamed text as initial_prompt so Whisper has
+                # sentence context and doesn't repeat the boundary word from the
+                # previous chunk's end when starting a new chunk.
+                context_prompt = (
+                    (self._transcriber._initial_prompt or "") + " " + self._stream_typed
+                ).strip() or None
+
+                self._transcriber.transcribe(
+                    chunk, self._sample_rate, on_segment=_on_seg,
+                    initial_prompt_override=context_prompt,
+                )
 
                 if parts:
                     chunk_text = " ".join(parts)
@@ -600,11 +614,27 @@ class DictateGUI:
                         (self._stream_typed + " " + chunk_text).strip()
                         if self._stream_typed else chunk_text
                     )
-                    # Advance the sample pointer to the end of the snapshot we just used
-                    self._stream_last_sample = len(full_audio)
+                    # Advance the sample pointer to just after the last spoken word
+                    # (using the word timestamp Whisper recorded) rather than to the
+                    # raw end of the chunk.  This avoids cutting mid-word: the next
+                    # chunk will start a little before where speech ended, giving
+                    # Whisper a clean boundary.  If no word timestamp is available,
+                    # fall back to the full chunk length.
+                    last_word_end = self._transcriber._last_word_end_sec  # seconds in chunk
+                    if last_word_end > 0:
+                        # Add a small 80 ms pad so we don't clip the final consonant
+                        pad = int(0.08 * self._sample_rate)
+                        advance = min(
+                            offset + int(last_word_end * self._sample_rate) + pad,
+                            len(full_audio),
+                        )
+                    else:
+                        advance = len(full_audio)
+                    self._stream_last_sample = advance
                     self._last_typed = chunk_text + (" " if self._trailing_space else "")
-                    log.info("Streaming: typed chunk %r (total streamed: %r)",
-                             chunk_text, self._stream_typed)
+                    log.info("Streaming: typed chunk %r  last_word_end=%.2fs  "
+                             "advance=%d (total streamed: %r)",
+                             chunk_text, last_word_end, advance, self._stream_typed)
                 else:
                     log.info("Stream tick: chunk produced no segments (silence?)")
 
