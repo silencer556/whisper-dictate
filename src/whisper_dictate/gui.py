@@ -607,6 +607,54 @@ class DictateGUI:
 
                 if parts:
                     chunk_text = " ".join(parts)
+
+                    # ── Partial-word / boundary-dash cleanup ──────────────────
+                    # Whisper signals a mid-utterance audio cut by appending a
+                    # trailing dash to the last word (e.g. "to-", "CH-",
+                    # "during-").  Strip that partial word and back the sample
+                    # pointer up so the next chunk re-transcribes it in full.
+                    # Also strip a bare trailing " -" that sometimes appears
+                    # when the chunk ends at a clause boundary.
+                    _backed_up = False
+                    chunk_words = chunk_text.split()
+                    if chunk_words and chunk_words[-1].rstrip().endswith('-'):
+                        # Remove the partial token from what we type
+                        chunk_words.pop()
+                        chunk_text = " ".join(chunk_words)
+                        # Back up ~600 ms so the next chunk captures the full word
+                        backup = int(0.6 * self._sample_rate)
+                        _backed_up = True
+                        log.info("Stripped trailing partial-word, will back up 0.6s")
+
+                    # Strip a lone trailing dash left after joining segments
+                    if chunk_text.endswith(' -') or chunk_text == '-':
+                        chunk_text = chunk_text.rstrip(' -').strip()
+                        _backed_up = True
+
+                    if not chunk_text:
+                        # Entire chunk was a partial word — don't advance the
+                        # pointer so the next tick retries with more audio
+                        log.info("Stream tick: chunk was entirely partial, skipping")
+                        return
+
+                    # ── Sample-pointer advance ────────────────────────────────
+                    # Use the end-time of the last COMPLETE word Whisper reported
+                    # rather than the raw snapshot length, so we never start the
+                    # next chunk mid-syllable.
+                    last_word_end = self._transcriber._last_word_end_sec
+                    if last_word_end > 0:
+                        pad = int(0.08 * self._sample_rate)   # 80 ms safety pad
+                        advance = min(
+                            offset + int(last_word_end * self._sample_rate) + pad,
+                            len(full_audio),
+                        )
+                    else:
+                        advance = len(full_audio)
+
+                    if _backed_up:
+                        backup = int(0.6 * self._sample_rate)
+                        advance = max(offset, advance - backup)
+
                     type_text(chunk_text, self._output_method,
                               trailing_space=self._trailing_space,
                               keystroke_delay_ms=self._keystroke_delay_ms)
@@ -614,27 +662,10 @@ class DictateGUI:
                         (self._stream_typed + " " + chunk_text).strip()
                         if self._stream_typed else chunk_text
                     )
-                    # Advance the sample pointer to just after the last spoken word
-                    # (using the word timestamp Whisper recorded) rather than to the
-                    # raw end of the chunk.  This avoids cutting mid-word: the next
-                    # chunk will start a little before where speech ended, giving
-                    # Whisper a clean boundary.  If no word timestamp is available,
-                    # fall back to the full chunk length.
-                    last_word_end = self._transcriber._last_word_end_sec  # seconds in chunk
-                    if last_word_end > 0:
-                        # Add a small 80 ms pad so we don't clip the final consonant
-                        pad = int(0.08 * self._sample_rate)
-                        advance = min(
-                            offset + int(last_word_end * self._sample_rate) + pad,
-                            len(full_audio),
-                        )
-                    else:
-                        advance = len(full_audio)
                     self._stream_last_sample = advance
                     self._last_typed = chunk_text + (" " if self._trailing_space else "")
-                    log.info("Streaming: typed chunk %r  last_word_end=%.2fs  "
-                             "advance=%d (total streamed: %r)",
-                             chunk_text, last_word_end, advance, self._stream_typed)
+                    log.info("Streaming: typed %r  last_word_end=%.2fs  advance=%d",
+                             chunk_text, last_word_end, advance)
                 else:
                     log.info("Stream tick: chunk produced no segments (silence?)")
 
