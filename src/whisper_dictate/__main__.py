@@ -82,9 +82,7 @@ def _cmd_gui(cfg: dict, config_path: Path) -> None:
         silence_threshold_db=a_cfg["silence_threshold_db"],
     )
 
-    print("Loading model in background — window will open immediately...")
-    threading.Thread(target=transcriber.load, daemon=True).start()
-
+    # Build the GUI first so the status callback has a root window to post to
     gui = DictateGUI(
         recorder=recorder,
         transcriber=transcriber,
@@ -96,8 +94,20 @@ def _cmd_gui(cfg: dict, config_path: Path) -> None:
         keystroke_delay_ms=o_cfg["keystroke_delay_ms"],
         auto_stop_silence_sec=a_cfg["auto_stop_silence_sec"],
         vad_threshold_db=a_cfg["vad_threshold_db"],
+        idle_stop_sec=a_cfg.get("idle_stop_sec", 30.0),
+        streaming_interval_sec=a_cfg.get("streaming_interval_sec", 0.0),
         config_path=config_path,
     )
+
+    # Load (or download) the model in the background; GUI shows progress
+    threading.Thread(
+        target=lambda: transcriber.load(
+            on_status=gui._on_model_status,
+            on_progress=gui._on_progress,
+        ),
+        daemon=True,
+    ).start()
+
     gui.run()
 
 

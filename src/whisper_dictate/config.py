@@ -32,6 +32,8 @@ DEFAULT_CONFIG: dict = {
         "silence_threshold_db": -50.0,
         "auto_stop_silence_sec": 1.5,
         "vad_threshold_db": -40.0,
+        "idle_stop_sec": 30.0,
+        "streaming_interval_sec": 0.0,  # 0 = disabled; >0 = type progressively while speaking
     },
     "output": {
         "method": "keystroke",

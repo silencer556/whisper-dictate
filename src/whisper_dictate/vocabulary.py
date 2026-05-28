@@ -6,6 +6,37 @@ log = logging.getLogger(__name__)
 # Section processing order — unique first so "@claire lee" wins before "claire lee"
 _SECTION_ORDER = ["unique", "punctuation", "terminology", "names"]
 
+# ---------------------------------------------------------------------------
+# Missing-period repair
+# ---------------------------------------------------------------------------
+# Whisper sometimes capitalises a word that starts a new sentence but omits
+# the period before it.  E.g.:
+#   "I went to the store And then I came home"  (missing ".")
+# We repair this by looking for a lowercase letter immediately followed by a
+# space and one of a fixed set of sentence-starting connectives.
+# The fix is conservative — only well-known conjunctions/adverbs are listed,
+# so proper nouns and ordinary mid-sentence capitals are left untouched.
+_SENTENCE_CONNECTIVES = (
+    "And|But|Or|So|Yet|Because|However|Therefore|Although|While|Since|"
+    "Though|Unless|Whether|Whereas|Meanwhile|Furthermore|Moreover|"
+    "Nevertheless|Nonetheless|Additionally|Consequently|Thus"
+)
+_MISSING_PERIOD_RE = re.compile(
+    r'([a-z])( (?:' + _SENTENCE_CONNECTIVES + r')\b)'
+)
+
+
+def fix_missing_periods(text: str) -> str:
+    """Insert a period where Whisper capitalised a new sentence but forgot the '.'.
+
+    Only fires for a conservative set of sentence-starting conjunctions /
+    adverbs, so ordinary proper nouns and mid-sentence capitals are left alone.
+    """
+    fixed, n = _MISSING_PERIOD_RE.subn(r'\1.\2', text)
+    if n:
+        log.debug("fix_missing_periods: %d insertion(s) in %r → %r", n, text, fixed)
+    return fixed
+
 
 def _flatten(vocab: dict) -> dict[str, str]:
     """Flatten a nested {section: {key: value}} vocab dict into a single {key: value} dict.

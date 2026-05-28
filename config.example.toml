@@ -14,8 +14,9 @@ channels = 1
 device_index = -1                # -1 = system default mic
 min_duration_sec = 0.3           # discard clips shorter than this
 silence_threshold_db = -50.0     # discard clips quieter than this (RMS dB)
-auto_stop_silence_sec = 1.5      # seconds of silence before auto-stop in continuous mode (0 = disabled)
-vad_threshold_db = -40.0         # dB level below which audio counts as silence for auto-stop
+auto_stop_silence_sec = 1.5      # pause duration that chops speech into segments (keep short)
+vad_threshold_db = -40.0         # dB level below which audio counts as silence
+idle_stop_sec = 30.0             # stop mic completely after this many seconds with no speech (0 = never)
 
 [output]
 method = "extension"             # keystroke | clipboard | extension | remote

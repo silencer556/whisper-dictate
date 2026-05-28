@@ -108,6 +108,17 @@ class Recorder:
                     cb = self._auto_stop_cb
                     threading.Thread(target=cb, daemon=True).start()
 
+    def snapshot(self) -> np.ndarray:
+        """Return a copy of audio captured so far without stopping the stream."""
+        with self._lock:
+            chunks = list(self._chunks)
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        audio = np.concatenate(chunks, axis=0)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        return audio.astype(np.float32)
+
     def stop(self) -> np.ndarray:
         """Stop recording and return float32 mono audio in [-1, 1]."""
         if self._stream is not None:

@@ -1,10 +1,35 @@
+import re
 import threading
 import time
 import logging
 import tkinter as tk
+import tkinter.ttk as ttk
 
 from .vocabulary import apply_substitutions
 from .output import type_text
+
+
+def _words_after_prefix(already: str, new_text: str) -> str:
+    """Return the portion of new_text that comes after the words already typed.
+
+    Comparison is done on cleaned (lowercased, punctuation-stripped) words so
+    minor Whisper inconsistencies in punctuation don't break the prefix match.
+    """
+    def _clean(s):
+        return re.sub(r'[^\w\s]', '', s.lower()).split()
+
+    already_words = _clean(already)
+    new_raw       = new_text.split()
+    new_clean     = _clean(new_text)
+
+    i = 0
+    while i < len(already_words) and i < len(new_clean):
+        if already_words[i] == new_clean[i]:
+            i += 1
+        else:
+            break   # mismatch — type from here onward
+
+    return " ".join(new_raw[i:])
 
 log = logging.getLogger(__name__)
 
@@ -14,9 +39,24 @@ _COLORS = {
     "transcribing": "#f5a623",
 }
 _LABELS = {
-    "idle":         "Idle — press hotkey to start",
+    "idle":         "Idle",
     "recording":    "Recording...",
     "transcribing": "Transcribing...",
+}
+
+# Dark-mode colour palette
+_D = {
+    "bg":         "#2b2b2b",   # window / frame backgrounds
+    "bg2":        "#333333",   # dropdown menus
+    "bg_input":   "#3a3a3a",   # text boxes, entries
+    "bg_btn":     "#3f3f3f",   # buttons (normal)
+    "bg_btn_act": "#555555",   # buttons (hover/active)
+    "title":      "#1e1e1e",   # compact title bar
+    "fg":         "#e0e0e0",   # primary text
+    "fg_dim":     "#999999",   # secondary / muted text
+    "fg_hint":    "#606060",   # very muted hints
+    "accent":     "#5294e2",   # blue (pending-command label)
+    "orange":     "#e8943a",   # uncertain-word highlight
 }
 
 
@@ -54,6 +94,7 @@ class DictateGUI:
                  hotkey: str = "win+`", output_method: str = "keystroke",
                  trailing_space: bool = True, keystroke_delay_ms: int = 10,
                  auto_stop_silence_sec: float = 1.5, vad_threshold_db: float = -40.0,
+                 idle_stop_sec: float = 30.0, streaming_interval_sec: float = 0.0,
                  config_path=None):
         self._recorder = recorder
         self._transcriber = transcriber
@@ -65,6 +106,8 @@ class DictateGUI:
         self._keystroke_delay_ms = keystroke_delay_ms
         self._auto_stop_silence_sec = auto_stop_silence_sec
         self._vad_threshold_db = vad_threshold_db
+        self._idle_stop_sec = idle_stop_sec
+        self._stream_interval_sec = streaming_interval_sec
 
         self._config_path = config_path
 
@@ -74,6 +117,17 @@ class DictateGUI:
         self._trigger_was_hotkey = False
         self._last_typed = ""           # text typed in last segment (for "delete that")
         self._pending_cmd_id: str | None = None   # after() timer id for deferred command
+        self._last_speech_time: float = 0.0       # monotonic time of last transcribed speech
+        self._cancel_session = False              # set True by "whisper cancel" command
+        self._last_transcription = ""             # full text of last completed session (for resend)
+        self._drag_ox = 0                         # drag origin for borderless compact window
+
+        # Streaming transcription state  (_stream_interval_sec already set above from param)
+        self._stream_typed: str = ""              # text already typed via streaming ticks
+        self._stream_timer: threading.Timer | None = None
+        self._stream_lock = threading.Lock()
+        self._stream_busy = False
+        self._drag_oy = 0
 
         self.root = tk.Tk()
         self.root.title("Whisper Dictate")
@@ -87,67 +141,186 @@ class DictateGUI:
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        outer = tk.Frame(self.root, padx=20, pady=16)
-        outer.pack()
+        self._compact = False
+        self.root.configure(bg=_D["bg"])
 
-        self._canvas = tk.Canvas(outer, width=52, height=52, highlightthickness=0, bg=self.root["bg"])
+        # StringVar shared between expanded status label and compact strip
+        self._status_var = tk.StringVar(value=_LABELS["idle"])
+
+        # ── Compact horizontal strip (borderless, shown instead of _outer) ───
+        # Layout: [✕] [●] [status text ............] [⊞]
+        self._compact_frame = tk.Frame(self.root, bg=_D["title"])
+        # (not packed yet — shown by _toggle_compact)
+
+        tk.Button(self._compact_frame, text="✕", command=self._on_close,
+                  bg=_D["title"], fg=_D["fg_dim"], font=("Segoe UI", 11),
+                  relief=tk.FLAT, bd=0, activebackground="#e74c3c",
+                  activeforeground="white", padx=8,
+                  cursor="arrow").pack(side="left")
+
+        self._compact_canvas = tk.Canvas(self._compact_frame, width=15, height=15,
+                                         highlightthickness=0, bg=_D["title"])
+        self._compact_canvas.pack(side="left", padx=(5, 0), pady=10)
+        self._compact_dot = self._compact_canvas.create_oval(
+            1, 1, 14, 14, fill=_COLORS["idle"], outline="")
+
+        self._compact_lbl = tk.Label(
+            self._compact_frame, textvariable=self._status_var,
+            font=("Segoe UI", 10), bg=_D["title"], fg=_D["fg"],
+            width=15, anchor="w",
+        )
+        self._compact_lbl.pack(side="left", padx=(5, 0))
+
+        tk.Button(self._compact_frame, text="⊞", command=self._toggle_compact,
+                  bg=_D["title"], fg=_D["fg_dim"], font=("Segoe UI", 11),
+                  relief=tk.FLAT, bd=0, activebackground=_D["bg_btn"],
+                  activeforeground=_D["fg"], padx=8).pack(side="right")
+
+        # The whole strip is a drag handle except the two buttons
+        for w in (self._compact_frame, self._compact_lbl):
+            w.bind("<ButtonPress-1>", self._drag_start)
+            w.bind("<B1-Motion>",     self._drag_motion)
+
+        # ── Expanded layout ───────────────────────────────────────────
+        self._outer = tk.Frame(self.root, padx=20, pady=16, bg=_D["bg"])
+        self._outer.pack()
+
+        # ── Always-visible: dot + status ──────────────────────────────
+        self._canvas = tk.Canvas(self._outer, width=52, height=52,
+                                 highlightthickness=0, bg=_D["bg"])
         self._canvas.pack()
         self._dot = self._canvas.create_oval(6, 6, 46, 46, fill=_COLORS["idle"], outline="")
 
-        self._status_var = tk.StringVar(value=_LABELS["idle"])
-        tk.Label(outer, textvariable=self._status_var, font=("Segoe UI", 11)).pack(pady=(2, 10))
+        tk.Label(self._outer, textvariable=self._status_var, font=("Segoe UI", 11),
+                 bg=_D["bg"], fg=_D["fg"]).pack(pady=(2, 4))
+
+        # Download progress bar — hidden until a model download starts
+        _pb_style = ttk.Style()
+        _pb_style.theme_use("default")
+        _pb_style.configure("WD.Horizontal.TProgressbar",
+                            troughcolor=_D["bg_input"],
+                            background=_D["accent"],
+                            bordercolor=_D["bg"],
+                            lightcolor=_D["accent"],
+                            darkcolor=_D["accent"])
+        self._progress_frame = tk.Frame(self._outer, bg=_D["bg"])
+        # (not packed yet)
+        self._progress_bar = ttk.Progressbar(
+            self._progress_frame, length=220, mode="determinate",
+            style="WD.Horizontal.TProgressbar")
+        self._progress_bar.pack(side="left", padx=(0, 8))
+        self._progress_pct_var = tk.StringVar(value="")
+        tk.Label(self._progress_frame, textvariable=self._progress_pct_var,
+                 font=("Segoe UI", 8), bg=_D["bg"], fg=_D["fg_dim"],
+                 width=5, anchor="w").pack(side="left")
+
+        # ── Collapsible section ────────────────────────────────────────
+        self._detail_frame = tk.Frame(self._outer, bg=_D["bg"])
+        self._detail_frame.pack()
 
         hotkey_label = self._hotkey.replace("+", " + ").upper()
         self._btn = tk.Button(
-            outer,
+            self._detail_frame,
             text=f"Start   [ {hotkey_label} ]",
             command=self._toggle,
-            width=26,
-            height=2,
+            width=26, height=2,
             font=("Segoe UI", 10),
+            bg=_D["bg_btn"], fg=_D["fg"],
+            activebackground=_D["bg_btn_act"], activeforeground=_D["fg"],
+            relief=tk.FLAT, bd=0,
         )
-        self._btn.pack(pady=(0, 14))
+        self._btn.pack(pady=(4, 14))
 
-        tk.Label(outer, text="Last transcription:", anchor="w", font=("Segoe UI", 9)).pack(fill="x")
+        tk.Label(self._detail_frame, text="Last transcription:", anchor="w",
+                 font=("Segoe UI", 9), bg=_D["bg"], fg=_D["fg_dim"]).pack(fill="x")
         self._text = tk.Text(
-            outer,
-            height=5,
-            width=46,
+            self._detail_frame,
+            height=5, width=46,
             wrap=tk.WORD,
             state=tk.DISABLED,
             font=("Segoe UI", 10),
-            relief=tk.SUNKEN,
-            bd=1,
+            relief=tk.FLAT, bd=0,
+            bg=_D["bg_input"], fg=_D["fg"],
+            insertbackground=_D["fg"],
         )
         self._text.pack(pady=(2, 0))
 
-        # Pending-command countdown (shows "↵ Enter in 1.5 s — keep talking to cancel")
+        # Pending-command countdown
         self._pending_var = tk.StringVar()
-        tk.Label(outer, textvariable=self._pending_var,
-                 font=("Segoe UI", 8, "italic"), fg="#3498db").pack(fill="x", pady=(2, 0))
+        tk.Label(self._detail_frame, textvariable=self._pending_var,
+                 font=("Segoe UI", 8, "italic"),
+                 fg=_D["accent"], bg=_D["bg"]).pack(fill="x", pady=(2, 0))
 
-        # Clickable uncertain-words bar — each word is a link that opens the vocab dialog.
+        # Clickable uncertain-words bar
         self._conf_text = tk.Text(
-            outer, height=2, font=("Segoe UI", 8),
+            self._detail_frame, height=2, font=("Segoe UI", 8),
             wrap=tk.WORD, state=tk.DISABLED,
-            relief=tk.FLAT, bd=0, bg=self.root["bg"], cursor="arrow",
+            relief=tk.FLAT, bd=0,
+            bg=_D["bg"], fg=_D["fg"],
+            cursor="arrow",
         )
-        self._conf_text.tag_configure("label", foreground="#888888")
+        self._conf_text.tag_configure("label", foreground=_D["fg_dim"])
         self._conf_text.pack(fill="x", pady=(2, 0))
 
-        btn_row = tk.Frame(outer)
+        btn_row = tk.Frame(self._detail_frame, bg=_D["bg"])
         btn_row.pack(pady=(6, 0))
 
         self._copy_btn = tk.Button(
             btn_row, text="Copy text", command=self._copy_transcription,
             font=("Segoe UI", 9), width=12,
+            bg=_D["bg_btn"], fg=_D["fg"],
+            activebackground=_D["bg_btn_act"], activeforeground=_D["fg"],
+            relief=tk.FLAT, bd=0,
         )
         self._copy_btn.pack(side="left", padx=(0, 8))
 
         tk.Button(
             btn_row, text="Settings", command=self._show_settings,
-            font=("Segoe UI", 9), relief=tk.FLAT, fg="#555555",
+            font=("Segoe UI", 9), relief=tk.FLAT, bd=0,
+            bg=_D["bg"], fg=_D["fg_dim"],
+            activebackground=_D["bg_btn"], activeforeground=_D["fg"],
         ).pack(side="left")
+
+        tk.Button(
+            btn_row, text="⊟", command=self._toggle_compact,
+            font=("Segoe UI", 9), relief=tk.FLAT, bd=0,
+            bg=_D["bg"], fg=_D["fg_dim"],
+            activebackground=_D["bg_btn"], activeforeground=_D["fg"],
+        ).pack(side="left", padx=(8, 0))
+
+    def _toggle_compact(self):
+        self._compact = not self._compact
+        if self._compact:
+            # Hide the full expanded panel and go borderless
+            self._outer.pack_forget()
+            self.root.withdraw()
+            self.root.overrideredirect(True)
+            self._compact_frame.pack(fill="x")
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            # Freeze to a slim horizontal strip; enforce a minimum drag width
+            self.root.geometry("")
+            self.root.update_idletasks()
+            w = max(self.root.winfo_width(), 240)
+            h = self.root.winfo_height()
+            self.root.geometry(f"{w}x{h}")
+        else:
+            # Restore the full panel
+            self._compact_frame.pack_forget()
+            self.root.withdraw()
+            self.root.overrideredirect(False)
+            self._outer.pack()
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.root.geometry("")
+            self.root.update_idletasks()
+
+    def _drag_start(self, event):
+        self._drag_ox = event.x_root - self.root.winfo_x()
+        self._drag_oy = event.y_root - self.root.winfo_y()
+
+    def _drag_motion(self, event):
+        self.root.geometry(f"+{event.x_root - self._drag_ox}+{event.y_root - self._drag_oy}")
 
     # ------------------------------------------------------------------
     # Hotkey
@@ -270,13 +443,54 @@ class DictateGUI:
     # State machine
     # ------------------------------------------------------------------
 
+    def _on_model_status(self, status: str) -> None:
+        """Called from the background model-loading thread."""
+        if status == "downloading":
+            self.root.after(0, self._show_download_start)
+        elif status == "loading":
+            self.root.after(0, self._show_loading)
+        else:  # ready
+            self.root.after(0, self._hide_progress)
+            self.root.after(0, lambda: self._set_state("idle"))
+
+    def _show_download_start(self) -> None:
+        self._canvas.itemconfig(self._dot, fill=_D["accent"])
+        self._compact_canvas.itemconfig(self._compact_dot, fill=_D["accent"])
+        self._status_var.set("Downloading model…")
+        self._progress_bar["value"] = 0
+        self._progress_pct_var.set("0%")
+        self._progress_frame.pack(pady=(0, 6))
+
+    def _show_loading(self) -> None:
+        self._canvas.itemconfig(self._dot, fill=_D["accent"])
+        self._compact_canvas.itemconfig(self._compact_dot, fill=_D["accent"])
+        self._status_var.set("Loading model…")
+        self._hide_progress()   # no bar needed for cache load
+
+    def _hide_progress(self) -> None:
+        self._progress_frame.pack_forget()
+        self._progress_pct_var.set("")
+
+    def _on_progress(self, fraction: float) -> None:
+        """Called from download thread with 0.0–1.0. Schedules a UI update."""
+        self.root.after(0, lambda f=fraction: self._update_progress(f))
+
+    def _update_progress(self, fraction: float) -> None:
+        pct = int(fraction * 100)
+        self._progress_bar["value"] = pct
+        self._progress_pct_var.set(f"{pct}%")
+        # Keep compact strip text in sync too
+        self._status_var.set(f"Downloading…  {pct}%")
+
     def _set_state(self, state: str, transcription: str | None = None):
         """Must be called from the tkinter main thread."""
         self._state = state
-        self._canvas.itemconfig(self._dot, fill=_COLORS.get(state, "#888888"))
+        color = _COLORS.get(state, "#888888")
+        self._canvas.itemconfig(self._dot, fill=color)
+        self._compact_canvas.itemconfig(self._compact_dot, fill=color)
 
         if state == "recording" and self._continuous:
-            label = "Listening...  (press hotkey to stop)"
+            label = "Listening..."
         elif state == "idle" and not self._continuous:
             label = _LABELS["idle"]
         else:
@@ -285,9 +499,11 @@ class DictateGUI:
 
         hotkey_label = self._hotkey.replace("+", " + ").upper()
         if self._continuous:
-            self._btn.config(text=f"Stop   [ {hotkey_label} ]")
+            self._btn.config(text=f"Stop   [ {hotkey_label} ]",
+                             bg="#4a2020", activebackground="#5e2828")
         else:
-            self._btn.config(text=f"Start   [ {hotkey_label} ]")
+            self._btn.config(text=f"Start   [ {hotkey_label} ]",
+                             bg=_D["bg_btn"], activebackground=_D["bg_btn_act"])
 
         if transcription is not None:
             self._text.config(state=tk.NORMAL)
@@ -302,7 +518,14 @@ class DictateGUI:
         if state == "idle":
             self._continuous = True
             self._trigger_was_hotkey = True  # hotkey never moves focus
-            self._begin_recording(beep=True)
+            self._begin_recording(beep=True, reset_idle=True)
+        elif state == "transcribing" and not self._continuous:
+            # Previous clip is still transcribing — start the next recording immediately.
+            # The in-flight transcription will finish and type its result in the background
+            # without touching the state (guarded in _transcribe_worker).
+            self._continuous = True
+            self._trigger_was_hotkey = True
+            self._begin_recording(beep=True, reset_idle=True)
         elif self._continuous:
             # User pressed hotkey again — exit continuous mode
             self._continuous = False
@@ -310,15 +533,19 @@ class DictateGUI:
                 self._end_recording(restart=False, beep=True)
             # If transcribing, _transcribe_worker will see _continuous=False and go idle
 
-    def _begin_recording(self, beep: bool = False):
+    def _begin_recording(self, beep: bool = False, reset_idle: bool = False):
         self._set_state("recording")
         self._update_conf_display({})  # clear stale confidence info
+        if reset_idle:
+            self._last_speech_time = time.monotonic()
         # If the user keeps talking, cancel any command that was waiting to fire.
         if self._pending_cmd_id is not None:
             self.root.after_cancel(self._pending_cmd_id)
             self._pending_cmd_id = None
             self._pending_var.set("")
             log.debug("Pending command cancelled — new speech detected")
+        # Reset streaming state for this new recording session
+        self._stream_typed = ""
         if beep:
             threading.Thread(target=_beep_start, daemon=True).start()
         self._recorder.start(
@@ -326,24 +553,114 @@ class DictateGUI:
             silence_timeout_sec=self._auto_stop_silence_sec,
             vad_threshold_db=self._vad_threshold_db,
         )
+        # Start streaming ticker if enabled
+        log.info("Streaming: interval=%.1fs (0=disabled)", self._stream_interval_sec)
+        if self._stream_interval_sec > 0:
+            self._schedule_stream_tick()
+
+    def _schedule_stream_tick(self):
+        if self._stream_interval_sec > 0:
+            self._stream_timer = threading.Timer(
+                self._stream_interval_sec, self._stream_tick)
+            self._stream_timer.daemon = True
+            self._stream_timer.start()
+
+    def _stream_tick(self):
+        """Periodic background callback: transcribe audio so far, type new words."""
+        with self._state_lock:
+            if self._state != "recording":
+                return   # recording ended before timer fired
+
+        with self._stream_lock:
+            if self._stream_busy:
+                self._schedule_stream_tick()  # previous tick still running — retry
+                return
+            self._stream_busy = True
+
+        def _work():
+            try:
+                with self._state_lock:
+                    if self._state != "recording":
+                        return
+
+                audio = self._recorder.snapshot()
+                duration = len(audio) / self._sample_rate if self._sample_rate else 0
+                min_dur = max(1.5, self._stream_interval_sec * 0.4)
+                log.info("Stream tick: %.1fs audio (min=%.1fs)", duration, min_dur)
+                if duration < min_dur:
+                    return   # not enough audio yet
+
+                parts: list[str] = []
+
+                def _on_seg(raw, words=None):
+                    text = apply_substitutions(raw, self._vocab)
+                    if text:
+                        parts.append(text)
+
+                self._transcriber.transcribe(
+                    audio, self._sample_rate, on_segment=_on_seg)
+
+                if parts:
+                    full = " ".join(parts)
+                    new_text = _words_after_prefix(self._stream_typed, full)
+                    log.info("Stream tick: transcribed %r  already_typed=%r  new=%r",
+                             full, self._stream_typed, new_text)
+                    if new_text:
+                        type_text(new_text, self._output_method,
+                                  trailing_space=self._trailing_space,
+                                  keystroke_delay_ms=self._keystroke_delay_ms)
+                        self._stream_typed = full
+                        self._last_typed = new_text + (" " if self._trailing_space else "")
+                        log.info("Streaming: typed %d new words: %r", len(new_text.split()), new_text)
+                else:
+                    log.info("Stream tick: no segments returned from transcriber")
+
+            except Exception as exc:
+                log.error("Stream tick error: %s", exc)
+            finally:
+                with self._stream_lock:
+                    self._stream_busy = False
+                # Schedule next tick only if still recording
+                with self._state_lock:
+                    if self._state == "recording":
+                        self._schedule_stream_tick()
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _on_vad_silence(self):
         """Called from recorder thread when silence threshold is reached."""
         self.root.after(0, lambda: self._end_recording(restart=True, beep=False))
 
     def _end_recording(self, restart: bool = False, beep: bool = False):
+        # Cancel streaming timer first to prevent a tick racing the final transcription
+        if self._stream_timer is not None:
+            self._stream_timer.cancel()
+            self._stream_timer = None
+
         with self._state_lock:
             if self._state != "recording":
                 return  # Guard against double-fire
+
+        # If a streaming tick is mid-transcription, wait briefly for it to finish
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            with self._stream_lock:
+                if not self._stream_busy:
+                    break
+            time.sleep(0.05)
+
+        stream_typed_snapshot = self._stream_typed   # capture before reset
+
         audio = self._recorder.stop()
         if beep:
             threading.Thread(target=_beep_stop, daemon=True).start()
         self._set_state("transcribing")
         threading.Thread(
-            target=self._transcribe_worker, args=(audio, restart), daemon=True
+            target=self._transcribe_worker,
+            args=(audio, restart, stream_typed_snapshot), daemon=True
         ).start()
 
-    def _transcribe_worker(self, audio, restart_after: bool):
+    def _transcribe_worker(self, audio, restart_after: bool, stream_typed: str = ""):
         displayed: list[str] = []
         from .commands import find_command, run_action
 
@@ -351,7 +668,14 @@ class DictateGUI:
         _CONF_THRESHOLD = 0.75
         uncertain_seen: dict[str, float] = {}   # word -> lowest probability seen
 
+        # Track how much of the full transcript we've already accounted for via streaming.
+        # This lets us skip re-typing words that were already sent during the streaming ticks.
+        _stream_prefix_consumed = False   # True once we've skipped past the streamed portion
+
         def on_segment(raw: str, words=None):
+            nonlocal _stream_prefix_consumed
+            if self._cancel_session:
+                return   # already cancelled — ignore remaining segments
             text = apply_substitutions(raw, self._vocab)
             if not text:
                 return
@@ -369,12 +693,39 @@ class DictateGUI:
 
             text_to_type, action = find_command(text)
 
+            if action == "cancel":
+                log.info("Command: cancel — discarding segment and stopping")
+                self._cancel_session = True
+                return   # don't type text_to_type; _transcribe_worker checks flag after
+
+            if action == "resend":
+                if self._last_transcription:
+                    log.info("Command: resend — retyping %r", self._last_transcription)
+                    type_text(self._last_transcription, self._output_method,
+                              self._trailing_space, self._keystroke_delay_ms)
+                else:
+                    log.debug("Command: resend — nothing to resend")
+                return   # discard text_to_type (don't also type any prefix)
+
             if text_to_type:
+                self._last_speech_time = time.monotonic()  # reset idle timer on real speech
+
+                # Skip words already typed by streaming ticks
+                actual_to_type = text_to_type
+                if stream_typed and not _stream_prefix_consumed:
+                    # Build the full text we have so far (what streaming typed + this segment)
+                    so_far = " ".join(displayed + [text_to_type]) if displayed else text_to_type
+                    actual_to_type = _words_after_prefix(stream_typed, so_far)
+                    # Once we've consumed the streamed prefix, stop checking
+                    if len(so_far.split()) >= len(stream_typed.split()):
+                        _stream_prefix_consumed = True
+
                 displayed.append(text_to_type)
                 self.root.after(0, lambda t=" ".join(displayed): self._update_display(t))
-                type_text(text_to_type, self._output_method, self._trailing_space,
-                          self._keystroke_delay_ms)
-                self._last_typed = text_to_type + (" " if self._trailing_space else "")
+                if actual_to_type:
+                    type_text(actual_to_type, self._output_method, self._trailing_space,
+                              self._keystroke_delay_ms)
+                    self._last_typed = actual_to_type + (" " if self._trailing_space else "")
 
             if action:
                 _CMD_LABELS = {
@@ -413,15 +764,43 @@ class DictateGUI:
             self._continuous = False
             return
 
+        # "whisper cancel" command was detected — discard everything and go idle
+        if self._cancel_session:
+            self._cancel_session = False
+            self._continuous = False
+            threading.Thread(target=_beep_stop, daemon=True).start()
+            self.root.after(0, lambda: self._set_state("idle", transcription="(cancelled)"))
+            return
+
         final = " ".join(displayed) if displayed else "(nothing detected)"
+        if displayed:
+            self._last_transcription = " ".join(displayed)
 
         if restart_after and self._continuous:
-            # Continuous mode — show result briefly then start listening again
-            self.root.after(0, lambda: self._set_state("transcribing", transcription=final))
-            self.root.after(0, lambda: self._begin_recording(beep=False))
+            # Check idle-stop: if no real speech for idle_stop_sec, quit completely.
+            if (self._idle_stop_sec > 0 and self._last_speech_time > 0 and
+                    time.monotonic() - self._last_speech_time >= self._idle_stop_sec):
+                log.info("Idle timeout (%.0fs without speech) — stopping", self._idle_stop_sec)
+                self._continuous = False
+                threading.Thread(target=_beep_stop, daemon=True).start()
+                self.root.after(0, lambda: self._set_state("idle",
+                                transcription="(stopped — no speech detected)"))
+            else:
+                # Continuous mode — show result briefly then start listening again
+                self.root.after(0, lambda: self._set_state("transcribing", transcription=final))
+                self.root.after(0, lambda: self._begin_recording(beep=False))
         else:
-            self._continuous = False
-            self.root.after(0, lambda: self._set_state("idle", transcription=final))
+            # Guard: if the user started a new recording while we were transcribing,
+            # don't clobber the "recording" state — just update the text display.
+            with self._state_lock:
+                already_recording = (self._state == "recording")
+            if already_recording:
+                log.debug("Transcription done but new recording active — skipping idle transition")
+                if final and final != "(nothing detected)":
+                    self.root.after(0, lambda: self._update_display(final))
+            else:
+                self._continuous = False
+                self.root.after(0, lambda: self._set_state("idle", transcription=final))
 
     def _update_display(self, text: str):
         self._text.config(state=tk.NORMAL)
@@ -458,7 +837,7 @@ class DictateGUI:
                 if i:
                     self._conf_text.insert(tk.END, "   ", "label")
                 tag = f"w_{i}"
-                self._conf_text.tag_configure(tag, foreground="#e67e22", underline=True)
+                self._conf_text.tag_configure(tag, foreground=_D["orange"], underline=True)
                 self._conf_text.tag_bind(tag, "<Button-1>",
                     lambda e, w=word, p=prob: self._show_vocab_add(w, p))
                 self._conf_text.tag_bind(tag, "<Enter>",
@@ -477,32 +856,43 @@ class DictateGUI:
         win.title("Add to vocabulary")
         win.resizable(False, False)
         win.attributes("-topmost", True)
+        win.configure(bg=_D["bg"])
         win.grab_set()
 
-        f = tk.Frame(win, padx=18, pady=14)
+        f = tk.Frame(win, padx=18, pady=14, bg=_D["bg"])
         f.pack()
 
-        tk.Label(f, text="Whisper heard:", font=("Segoe UI", 9), anchor="w").grid(
+        def _lbl(text, **kw):
+            return tk.Label(f, text=text, bg=_D["bg"], fg=_D["fg"], **kw)
+
+        _lbl("Whisper heard:", font=("Segoe UI", 9), anchor="w").grid(
             row=0, column=0, sticky="w", pady=4)
-        tk.Label(f, text=f'"{heard}"  ({prob:.0%} confidence)',
-                 font=("Segoe UI", 9, "italic"), fg="#e67e22").grid(
+        _lbl(f'"{heard}"  ({prob:.0%} confidence)',
+             font=("Segoe UI", 9, "italic"), fg=_D["orange"]).grid(
             row=0, column=1, sticky="w", padx=(10, 0))
 
-        tk.Label(f, text="Replace with:", font=("Segoe UI", 9), anchor="w").grid(
+        _lbl("Replace with:", font=("Segoe UI", 9), anchor="w").grid(
             row=1, column=0, sticky="w", pady=4)
         replace_var = tk.StringVar(value=heard.title())
-        entry = tk.Entry(f, textvariable=replace_var, width=28, font=("Segoe UI", 10))
+        entry = tk.Entry(f, textvariable=replace_var, width=28, font=("Segoe UI", 10),
+                         bg=_D["bg_input"], fg=_D["fg"], insertbackground=_D["fg"],
+                         relief=tk.FLAT, highlightthickness=1,
+                         highlightbackground=_D["bg_btn"])
         entry.grid(row=1, column=1, sticky="w", padx=(10, 0))
         entry.selection_range(0, tk.END)
         entry.focus_set()
 
-        tk.Label(f, text="Section:", font=("Segoe UI", 9), anchor="w").grid(
+        _lbl("Section:", font=("Segoe UI", 9), anchor="w").grid(
             row=2, column=0, sticky="w", pady=4)
         section_var = tk.StringVar(value="terminology")
-        tk.OptionMenu(f, section_var, "terminology", "names", "unique", "punctuation").grid(
-            row=2, column=1, sticky="w", padx=(10, 0))
-        tk.Label(f, text="terminology = jargon/acronyms  |  names = people/places",
-                 font=("Segoe UI", 7), fg="#888").grid(
+        om = tk.OptionMenu(f, section_var, "terminology", "names", "unique", "punctuation")
+        om.config(bg=_D["bg_btn"], fg=_D["fg"], relief=tk.FLAT, highlightthickness=0,
+                  activebackground=_D["bg_btn_act"], activeforeground=_D["fg"])
+        om["menu"].config(bg=_D["bg2"], fg=_D["fg"],
+                          activebackground=_D["accent"], activeforeground="white")
+        om.grid(row=2, column=1, sticky="w", padx=(10, 0))
+        _lbl("terminology = jargon/acronyms  |  names = people/places",
+             font=("Segoe UI", 7), fg=_D["fg_hint"]).grid(
             row=3, column=0, columnspan=2, sticky="w")
 
         def on_save():
@@ -519,11 +909,17 @@ class DictateGUI:
             log.info("Vocabulary: '%s' -> '%s' added to [%s]", heard, replacement, section)
             win.destroy()
 
-        btn_f = tk.Frame(win, pady=8)
+        btn_f = tk.Frame(win, pady=8, bg=_D["bg"])
         btn_f.pack()
-        tk.Button(btn_f, text="Cancel", command=win.destroy, width=10).pack(side="left", padx=4)
-        tk.Button(btn_f, text="Add", command=on_save, width=10,
-                  default="active").pack(side="left", padx=4)
+
+        def _dbtn(text, cmd, **kw):
+            return tk.Button(btn_f, text=text, command=cmd, width=10,
+                             bg=_D["bg_btn"], fg=_D["fg"],
+                             activebackground=_D["bg_btn_act"], activeforeground=_D["fg"],
+                             relief=tk.FLAT, bd=0, **kw)
+
+        _dbtn("Cancel", win.destroy).pack(side="left", padx=4)
+        _dbtn("Add", on_save).pack(side="left", padx=4)
         win.bind("<Return>", lambda e: on_save())
         win.bind("<Escape>", lambda e: win.destroy())
 
@@ -532,48 +928,141 @@ class DictateGUI:
     # ------------------------------------------------------------------
 
     def _show_settings(self):
+        import threading as _threading
         from .config import load_config, save_config, get_config_path
+        from .transcriber import MODEL_OPTIONS, MODEL_SIZES, _model_is_cached, cuda_available
         from . import ext_server as _ext
 
         cfg_path = self._config_path or get_config_path()
         cfg = load_config(cfg_path)
         o = cfg["output"]
+        w = cfg.get("whisper", {})
+
+        _cuda_ok = cuda_available()
 
         win = tk.Toplevel(self.root)
         win.title("Settings")
         win.resizable(False, False)
         win.attributes("-topmost", True)
+        win.configure(bg=_D["bg"])
         win.grab_set()
 
-        f = tk.Frame(win, padx=18, pady=14)
+        f = tk.Frame(win, padx=18, pady=14, bg=_D["bg"])
         f.pack()
 
         def row(label, r):
-            tk.Label(f, text=label, anchor="w", font=("Segoe UI", 10)).grid(
+            tk.Label(f, text=label, anchor="w", font=("Segoe UI", 10),
+                     bg=_D["bg"], fg=_D["fg"]).grid(
                 row=r, column=0, sticky="w", pady=5, padx=(0, 12))
 
+        def hint_lbl(r):
+            """Return a Label in column 2 that callers can configure later."""
+            lbl = tk.Label(f, text="", font=("Segoe UI", 8),
+                           fg=_D["fg_hint"], bg=_D["bg"])
+            lbl.grid(row=r, column=2, sticky="w", padx=(4, 0))
+            return lbl
+
+        def hint(text, r):
+            tk.Label(f, text=text, font=("Segoe UI", 8),
+                     fg=_D["fg_hint"], bg=_D["bg"]).grid(
+                row=r, column=2, sticky="w", padx=(4, 0))
+
+        def dark_om(var, *options):
+            om = tk.OptionMenu(f, var, *options)
+            om.config(bg=_D["bg_btn"], fg=_D["fg"], relief=tk.FLAT, highlightthickness=0,
+                      activebackground=_D["bg_btn_act"], activeforeground=_D["fg"])
+            om["menu"].config(bg=_D["bg2"], fg=_D["fg"],
+                              activebackground=_D["accent"], activeforeground="white")
+            return om
+
+        def dark_entry(var, **kw):
+            return tk.Entry(f, textvariable=var, font=("Segoe UI", 10),
+                            bg=_D["bg_input"], fg=_D["fg"], insertbackground=_D["fg"],
+                            relief=tk.FLAT, highlightthickness=1,
+                            highlightbackground=_D["bg_btn"], **kw)
+
+        # ── Output settings ───────────────────────────────────────────
         row("Output method:", 0)
         method_var = tk.StringVar(value=o["method"])
-        tk.OptionMenu(f, method_var, "auto", "keystroke", "clipboard", "extension").grid(
+        dark_om(method_var, "auto", "keystroke", "clipboard", "extension").grid(
             row=0, column=1, sticky="w")
-        tk.Label(f, text='  "auto" uses extension when CRD is open, keystroke otherwise',
-                 font=("Segoe UI", 8), fg="#666").grid(
-            row=0, column=2, sticky="w", padx=(4, 0))
+        hint('  "auto" uses extension when CRD is open, keystroke otherwise', 0)
 
         row("Extension port:", 1)
         port_var = tk.StringVar(value=str(o.get("extension_port", 9754)))
-        tk.Entry(f, textvariable=port_var, width=8, font=("Segoe UI", 10)).grid(
-            row=1, column=1, sticky="w")
+        dark_entry(port_var, width=8).grid(row=1, column=1, sticky="w")
 
         row("Trailing space:", 2)
         space_var = tk.BooleanVar(value=o.get("trailing_space", True))
-        tk.Checkbutton(f, variable=space_var).grid(row=2, column=1, sticky="w")
+        tk.Checkbutton(f, variable=space_var,
+                       bg=_D["bg"], fg=_D["fg"],
+                       selectcolor=_D["bg_input"],
+                       activebackground=_D["bg"], activeforeground=_D["fg"]).grid(
+            row=2, column=1, sticky="w")
 
         row("Keystroke delay (ms):", 3)
         delay_var = tk.StringVar(value=str(o.get("keystroke_delay_ms", 10)))
-        tk.Entry(f, textvariable=delay_var, width=8, font=("Segoe UI", 10)).grid(
-            row=3, column=1, sticky="w")
+        dark_entry(delay_var, width=8).grid(row=3, column=1, sticky="w")
 
+        row("Idle stop (sec):", 4)
+        idle_stop_var = tk.StringVar(
+            value=str(cfg.get("audio", {}).get("idle_stop_sec", 30.0)))
+        dark_entry(idle_stop_var, width=8).grid(row=4, column=1, sticky="w")
+        hint("  stop mic after this many seconds without speech  (0 = never)", 4)
+
+        row("Streaming interval (sec):", 5)
+        stream_var = tk.StringVar(
+            value=str(cfg.get("audio", {}).get("streaming_interval_sec", 0.0)))
+        dark_entry(stream_var, width=8).grid(row=5, column=1, sticky="w")
+        hint("  type progressively while speaking  (0 = off;  3–5 = recommended)", 5)
+
+        # ── Section divider ───────────────────────────────────────────
+        tk.Label(f, text="  Whisper model", font=("Segoe UI", 8, "bold"),
+                 bg=_D["bg"], fg=_D["fg_dim"]).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        tk.Frame(f, bg=_D["bg_btn"], height=1).grid(
+            row=7, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        # ── Model selector ────────────────────────────────────────────
+        row("Model:", 8)
+        current_model = w.get("model", "medium.en")
+        model_var = tk.StringVar(value=current_model)
+        dark_om(model_var, *MODEL_OPTIONS).grid(row=8, column=1, sticky="w")
+        model_hint = hint_lbl(8)
+
+        def _update_model_hint(*_):
+            m = model_var.get()
+            cached = _model_is_cached(m)
+            size = MODEL_SIZES.get(m, "")
+            if cached:
+                model_hint.config(text="  ✓ downloaded", fg="#5a9e5a")
+            else:
+                model_hint.config(text=f"  {size} — will download on save", fg=_D["orange"])
+
+        model_var.trace_add("write", _update_model_hint)
+        _update_model_hint()   # set initial state
+
+        # ── Device selector ───────────────────────────────────────────
+        row("Device:", 9)
+        _DEVICE_LABELS = {"cuda": "GPU (CUDA)", "cpu": "CPU"}
+        _DEVICE_VALUES = {"GPU (CUDA)": "cuda", "CPU": "cpu"}
+        current_device = w.get("device", "cuda")
+        device_label_var = tk.StringVar(
+            value=_DEVICE_LABELS.get(current_device, "GPU (CUDA)"))
+
+        device_om = dark_om(device_label_var, "GPU (CUDA)", "CPU")
+        device_om.grid(row=9, column=1, sticky="w")
+
+        if not _cuda_ok:
+            # Show GPU option but grayed out so users know it exists
+            device_om["menu"].entryconfig(0, state="disabled",
+                                          foreground=_D["fg_hint"])
+            device_label_var.set("CPU")
+            hint("  no CUDA GPU detected — install nvidia-cublas-cu12 to enable", 9)
+        else:
+            hint("  GPU is ~10–40× faster than CPU for transcription", 9)
+
+        # ── Save / Cancel ─────────────────────────────────────────────
         def on_save():
             method = method_var.get()
             try:
@@ -585,32 +1074,127 @@ class DictateGUI:
                 delay = int(delay_var.get())
             except ValueError:
                 delay = 10
+            try:
+                idle_stop = float(idle_stop_var.get())
+                if idle_stop < 0:
+                    idle_stop = 0.0
+            except ValueError:
+                idle_stop = 30.0
+            try:
+                stream_interval = float(stream_var.get())
+                if stream_interval < 0:
+                    stream_interval = 0.0
+            except ValueError:
+                stream_interval = 0.0
 
-            cfg["output"]["method"] = method
-            cfg["output"]["extension_port"] = port
-            cfg["output"]["trailing_space"] = trailing
+            new_model  = model_var.get()
+            new_device = _DEVICE_VALUES.get(device_label_var.get(), "cuda")
+            new_compute = "float16" if new_device == "cuda" else "int8"
+
+            model_changed = (new_model  != w.get("model",        "medium.en") or
+                             new_device != w.get("device",        "cuda"))
+
+            cfg["output"]["method"]           = method
+            cfg["output"]["extension_port"]   = port
+            cfg["output"]["trailing_space"]   = trailing
             cfg["output"]["keystroke_delay_ms"] = delay
+            cfg.setdefault("audio", {})["idle_stop_sec"] = idle_stop
+            cfg["audio"]["streaming_interval_sec"] = stream_interval
+            cfg.setdefault("whisper", {})["model"]        = new_model
+            cfg["whisper"]["device"]                      = new_device
+            cfg["whisper"]["compute_type"]                = new_compute
             save_config(cfg, cfg_path)
 
-            self._output_method = method
-            self._trailing_space = trailing
+            self._output_method      = method
+            self._trailing_space     = trailing
             self._keystroke_delay_ms = delay
+            self._idle_stop_sec      = idle_stop
+            self._stream_interval_sec = stream_interval
 
             if method in ("extension", "auto"):
                 _ext.start(port)
 
-            log.info("Settings saved: method=%s port=%d trailing=%s delay=%d",
-                     method, port, trailing, delay)
+            if model_changed:
+                log.info("Model changed to %s on %s — reloading", new_model, new_device)
+                _threading.Thread(
+                    target=lambda: self._transcriber.reload(
+                        model_name=new_model,
+                        device=new_device,
+                        compute_type=new_compute,
+                        on_status=self._on_model_status,
+                        on_progress=self._on_progress,
+                    ),
+                    daemon=True,
+                ).start()
+
+            log.info("Settings saved: method=%s model=%s device=%s", method, new_model, new_device)
             win.destroy()
 
-        btn_f = tk.Frame(win, pady=8)
+        btn_f = tk.Frame(win, pady=8, bg=_D["bg"])
         btn_f.pack()
-        tk.Button(btn_f, text="Cancel", command=win.destroy, width=10).pack(side="left", padx=4)
-        tk.Button(btn_f, text="Save", command=on_save, width=10, default="active").pack(side="left", padx=4)
+
+        def _dbtn(text, cmd, **kw):
+            return tk.Button(btn_f, text=text, command=cmd, width=10,
+                             bg=_D["bg_btn"], fg=_D["fg"],
+                             activebackground=_D["bg_btn_act"], activeforeground=_D["fg"],
+                             relief=tk.FLAT, bd=0, **kw)
+
+        _dbtn("Cancel", win.destroy).pack(side="left", padx=4)
+        _dbtn("Save", on_save).pack(side="left", padx=4)
         win.bind("<Return>", lambda _: on_save())
         win.bind("<Escape>", lambda _: win.destroy())
 
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # UI state persistence (position + compact mode)
+    # ------------------------------------------------------------------
+
+    def _ui_state_path(self):
+        from .config import get_config_path
+        base = self._config_path or get_config_path()
+        return base.parent / "ui_state.json"
+
+    def _load_ui_state(self) -> dict:
+        import json
+        try:
+            p = self._ui_state_path()
+            if p.exists():
+                with open(p) as f:
+                    return json.load(f)
+        except Exception as exc:
+            log.debug("Could not load UI state: %s", exc)
+        return {}
+
+    def _save_ui_state(self):
+        import json
+        try:
+            p = self._ui_state_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            state = {
+                "x": self.root.winfo_x(),
+                "y": self.root.winfo_y(),
+                "compact": self._compact,
+            }
+            with open(p, "w") as f:
+                json.dump(state, f)
+            log.debug("UI state saved: %s", state)
+        except Exception as exc:
+            log.warning("Could not save UI state: %s", exc)
+
+    def _on_close(self):
+        self._save_ui_state()
+        self.root.destroy()
+
+    # ------------------------------------------------------------------
+
     def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        ui = self._load_ui_state()
+        if "x" in ui and "y" in ui:
+            self.root.geometry(f"+{ui['x']}+{ui['y']}")
+        if ui.get("compact"):
+            self.root.after(100, self._toggle_compact)   # after first draw
+
         self.root.mainloop()

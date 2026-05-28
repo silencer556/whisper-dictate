@@ -25,6 +25,9 @@ _BUILT_IN: dict[str, str] = {
     "whisper scratch that": "delete_last",
     "whisper undo":         "undo",
     "whisper select all":   "select_all",
+    "whisper cancel":       "cancel",
+    "whisper stop":         "cancel",
+    "whisper resend":       "resend",
 }
 
 
