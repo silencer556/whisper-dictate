@@ -1055,8 +1055,8 @@ class DictateGUI:
         win.geometry("560x360")
 
         # ── Treeview ──────────────────────────────────────────────────
-        tree_frame = tk.Frame(win, bg=_D["bg"], padx=12, pady=(10, 0))
-        tree_frame.pack(fill="both", expand=True)
+        tree_frame = tk.Frame(win, bg=_D["bg"])
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=(10, 0))
 
         cols = ("section", "heard", "replacement")
         tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
