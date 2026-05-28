@@ -1,4 +1,3 @@
-import re
 import threading
 import time
 import logging
@@ -8,28 +7,6 @@ import tkinter.ttk as ttk
 from .vocabulary import apply_substitutions
 from .output import type_text
 
-
-def _words_after_prefix(already: str, new_text: str) -> str:
-    """Return the portion of new_text that comes after the words already typed.
-
-    Comparison is done on cleaned (lowercased, punctuation-stripped) words so
-    minor Whisper inconsistencies in punctuation don't break the prefix match.
-    """
-    def _clean(s):
-        return re.sub(r'[^\w\s]', '', s.lower()).split()
-
-    already_words = _clean(already)
-    new_raw       = new_text.split()
-    new_clean     = _clean(new_text)
-
-    i = 0
-    while i < len(already_words) and i < len(new_clean):
-        if already_words[i] == new_clean[i]:
-            i += 1
-        else:
-            break   # mismatch — type from here onward
-
-    return " ".join(new_raw[i:])
 
 log = logging.getLogger(__name__)
 
@@ -123,7 +100,8 @@ class DictateGUI:
         self._drag_ox = 0                         # drag origin for borderless compact window
 
         # Streaming transcription state  (_stream_interval_sec already set above from param)
-        self._stream_typed: str = ""              # text already typed via streaming ticks
+        self._stream_typed: str = ""              # concatenation of all streamed text this session
+        self._stream_last_sample: int = 0         # recorder sample index up to which we've streamed
         self._stream_timer: threading.Timer | None = None
         self._stream_lock = threading.Lock()
         self._stream_busy = False
@@ -546,6 +524,7 @@ class DictateGUI:
             log.debug("Pending command cancelled — new speech detected")
         # Reset streaming state for this new recording session
         self._stream_typed = ""
+        self._stream_last_sample = 0
         if beep:
             threading.Thread(target=_beep_start, daemon=True).start()
         self._recorder.start(
@@ -566,16 +545,22 @@ class DictateGUI:
             self._stream_timer.start()
 
     def _stream_tick(self):
-        """Periodic background callback: transcribe audio so far, type new words."""
+        """Periodic background callback: transcribe the new audio chunk since the last tick."""
         with self._state_lock:
             if self._state != "recording":
                 return   # recording ended before timer fired
 
         with self._stream_lock:
             if self._stream_busy:
-                self._schedule_stream_tick()  # previous tick still running — retry
+                # Previous tick still transcribing — keep cadence by rescheduling now
+                self._schedule_stream_tick()
                 return
             self._stream_busy = True
+
+        # Reschedule the NEXT tick immediately (before doing the slow transcription work)
+        # so the interval is wall-clock-based rather than completion-based.  This keeps
+        # the cadence steady regardless of how long each transcription takes.
+        self._schedule_stream_tick()
 
         def _work():
             try:
@@ -583,12 +568,19 @@ class DictateGUI:
                     if self._state != "recording":
                         return
 
-                audio = self._recorder.snapshot()
-                duration = len(audio) / self._sample_rate if self._sample_rate else 0
-                min_dur = max(1.5, self._stream_interval_sec * 0.4)
-                log.info("Stream tick: %.1fs audio (min=%.1fs)", duration, min_dur)
-                if duration < min_dur:
-                    return   # not enough audio yet
+                # Take a snapshot of ALL audio captured so far, then slice off the
+                # portion we haven't transcribed yet.  This gives us a fixed-size chunk
+                # (roughly one interval worth of audio) regardless of how long we've been
+                # recording, so transcription time stays constant tick-to-tick.
+                full_audio = self._recorder.snapshot()
+                offset = self._stream_last_sample
+                chunk = full_audio[offset:]
+
+                chunk_dur = len(chunk) / self._sample_rate if self._sample_rate else 0
+                min_dur = max(0.5, self._stream_interval_sec * 0.3)
+                log.info("Stream tick: chunk=%.1fs (offset=%d)", chunk_dur, offset)
+                if chunk_dur < min_dur:
+                    return   # not enough new audio in this chunk yet
 
                 parts: list[str] = []
 
@@ -597,33 +589,30 @@ class DictateGUI:
                     if text:
                         parts.append(text)
 
-                self._transcriber.transcribe(
-                    audio, self._sample_rate, on_segment=_on_seg)
+                self._transcriber.transcribe(chunk, self._sample_rate, on_segment=_on_seg)
 
                 if parts:
-                    full = " ".join(parts)
-                    new_text = _words_after_prefix(self._stream_typed, full)
-                    log.info("Stream tick: transcribed %r  already_typed=%r  new=%r",
-                             full, self._stream_typed, new_text)
-                    if new_text:
-                        type_text(new_text, self._output_method,
-                                  trailing_space=self._trailing_space,
-                                  keystroke_delay_ms=self._keystroke_delay_ms)
-                        self._stream_typed = full
-                        self._last_typed = new_text + (" " if self._trailing_space else "")
-                        log.info("Streaming: typed %d new words: %r", len(new_text.split()), new_text)
+                    chunk_text = " ".join(parts)
+                    type_text(chunk_text, self._output_method,
+                              trailing_space=self._trailing_space,
+                              keystroke_delay_ms=self._keystroke_delay_ms)
+                    self._stream_typed = (
+                        (self._stream_typed + " " + chunk_text).strip()
+                        if self._stream_typed else chunk_text
+                    )
+                    # Advance the sample pointer to the end of the snapshot we just used
+                    self._stream_last_sample = len(full_audio)
+                    self._last_typed = chunk_text + (" " if self._trailing_space else "")
+                    log.info("Streaming: typed chunk %r (total streamed: %r)",
+                             chunk_text, self._stream_typed)
                 else:
-                    log.info("Stream tick: no segments returned from transcriber")
+                    log.info("Stream tick: chunk produced no segments (silence?)")
 
             except Exception as exc:
                 log.error("Stream tick error: %s", exc)
             finally:
                 with self._stream_lock:
                     self._stream_busy = False
-                # Schedule next tick only if still recording
-                with self._state_lock:
-                    if self._state == "recording":
-                        self._schedule_stream_tick()
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -643,7 +632,6 @@ class DictateGUI:
 
         # Stop the recorder right away so no extra silence is captured while
         # we wait for any in-flight streaming tick to finish.
-        stream_typed_snapshot = self._stream_typed
         audio = self._recorder.stop()
 
         if beep:
@@ -651,10 +639,10 @@ class DictateGUI:
         self._set_state("transcribing")
         threading.Thread(
             target=self._transcribe_worker,
-            args=(audio, restart, stream_typed_snapshot), daemon=True
+            args=(audio, restart), daemon=True
         ).start()
 
-    def _transcribe_worker(self, audio, restart_after: bool, stream_typed: str = ""):
+    def _transcribe_worker(self, audio, restart_after: bool):
         # If a streaming tick is still running (race against end-of-recording), wait
         # for it to finish before we start the final transcription.  This is safe here
         # because we are already in a background thread — the main thread is never blocked.
@@ -665,20 +653,38 @@ class DictateGUI:
                     break
             time.sleep(0.05)
 
-        displayed: list[str] = []
+        # Read streaming state NOW (after waiting) so we see the completed tick's results.
+        stream_typed = self._stream_typed            # text typed by streaming ticks
+        stream_last_sample = self._stream_last_sample  # sample index up to which streaming covered
+
+        # With chunk-based streaming, the final pass only needs to handle the TAIL —
+        # the audio recorded after the last streaming tick completed.  There is nothing
+        # to deduplicate; the tail is genuinely new audio.
+        if stream_last_sample > 0 and stream_last_sample < len(audio):
+            tail_audio = audio[stream_last_sample:]
+            tail_dur = len(tail_audio) / self._sample_rate if self._sample_rate else 0
+            log.info("Final pass: transcribing %.1fs tail (offset=%d)", tail_dur, stream_last_sample)
+        elif stream_last_sample >= len(audio):
+            # Streaming covered everything — nothing left for the final pass
+            tail_audio = None
+            log.info("Final pass: streaming covered all audio, tail is empty")
+        else:
+            # No streaming was active — transcribe the full clip
+            tail_audio = audio
+            log.info("Final pass: no streaming, transcribing full %.1fs clip",
+                     len(audio) / self._sample_rate if self._sample_rate else 0)
+
+        # Seed the display with whatever streaming already typed so the final result
+        # shows the complete session (streamed prefix + tail), not just the tail.
+        displayed: list[str] = [stream_typed] if stream_typed else []
+
         from .commands import find_command, run_action
 
         # Uncertain words accumulate across segments for the whole recording session.
         _CONF_THRESHOLD = 0.75
         uncertain_seen: dict[str, float] = {}   # word -> lowest probability seen
 
-        # Word-count-based streaming dedup: track how many words we've accumulated
-        # across all displayed segments so we know which words streaming already typed.
-        _display_word_count = 0
-        _words_streamed = len(stream_typed.split()) if stream_typed else 0
-
         def on_segment(raw: str, words=None):
-            nonlocal _display_word_count
             if self._cancel_session:
                 return   # already cancelled — ignore remaining segments
             text = apply_substitutions(raw, self._vocab)
@@ -715,33 +721,13 @@ class DictateGUI:
             if text_to_type:
                 self._last_speech_time = time.monotonic()  # reset idle timer on real speech
 
-                # Skip words already typed by streaming ticks using word-count dedup.
-                # This is more robust than sequential word matching because Whisper's
-                # final pass may transcribe words slightly differently from the streaming
-                # passes (different capitalisation, punctuation, contractions, etc.).
-                seg_words = text_to_type.split()
-                seg_word_count = len(seg_words)
-                seg_start = _display_word_count          # word index where this segment starts
-                seg_end   = _display_word_count + seg_word_count
-
-                if _words_streamed > 0 and seg_end <= _words_streamed:
-                    # Entire segment was already typed by streaming — skip typing
-                    actual_to_type = ""
-                elif _words_streamed > 0 and seg_start < _words_streamed:
-                    # Segment is partially covered — type only the tail
-                    skip = _words_streamed - seg_start
-                    actual_to_type = " ".join(seg_words[skip:])
-                else:
-                    # Streaming didn't cover this segment at all (or streaming was off)
-                    actual_to_type = text_to_type
-
-                _display_word_count += seg_word_count
+                # Every segment from the final pass is genuinely new audio — type it all.
+                # (Chunk-based streaming means there is never any overlap to skip.)
                 displayed.append(text_to_type)
                 self.root.after(0, lambda t=" ".join(displayed): self._update_display(t))
-                if actual_to_type:
-                    type_text(actual_to_type, self._output_method, self._trailing_space,
-                              self._keystroke_delay_ms)
-                    self._last_typed = actual_to_type + (" " if self._trailing_space else "")
+                type_text(text_to_type, self._output_method, self._trailing_space,
+                          self._keystroke_delay_ms)
+                self._last_typed = text_to_type + (" " if self._trailing_space else "")
 
             if action:
                 _CMD_LABELS = {
@@ -772,13 +758,14 @@ class DictateGUI:
                 else:
                     _fire_command()
 
-        try:
-            self._transcriber.transcribe(audio, self._sample_rate, on_segment=on_segment)
-        except Exception as exc:
-            log.error("Transcription failed: %s", exc)
-            self.root.after(0, lambda: self._set_state("idle", transcription=f"[Error: {exc}]"))
-            self._continuous = False
-            return
+        if tail_audio is not None and len(tail_audio) > 0:
+            try:
+                self._transcriber.transcribe(tail_audio, self._sample_rate, on_segment=on_segment)
+            except Exception as exc:
+                log.error("Transcription failed: %s", exc)
+                self.root.after(0, lambda: self._set_state("idle", transcription=f"[Error: {exc}]"))
+                self._continuous = False
+                return
 
         # "whisper cancel" command was detected — discard everything and go idle
         if self._cancel_session:
