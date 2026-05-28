@@ -254,9 +254,34 @@ class Transcriber:
             language="en",
             initial_prompt=initial_prompt,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
+            vad_parameters={
+                # Default Silero threshold is 0.5 — too aggressive for normal speech,
+                # especially quieter sections or brief pauses mid-sentence.  0.3 keeps
+                # more of the audio and prevents words / whole sentences from being
+                # silently dropped before Whisper sees them.
+                "threshold": 0.3,
+                # Pad each detected speech region by 400 ms so we don't clip the
+                # leading/trailing consonants of words near silence boundaries.
+                "speech_pad_ms": 400,
+                # Keep silence gaps shorter than 500 ms merged into one speech region.
+                "min_silence_duration_ms": 500,
+            },
             word_timestamps=True,
         )
+
+        # Diagnostic: log how much audio the VAD kept.  If this is significantly
+        # less than the recording duration, speech is being incorrectly discarded.
+        if hasattr(info, "duration_after_vad") and info.duration_after_vad is not None:
+            retained_pct = 100.0 * info.duration_after_vad / duration if duration > 0 else 0
+            log.info(
+                "VAD retained %.2fs / %.2fs  (%.0f%% of clip)",
+                info.duration_after_vad, duration, retained_pct,
+            )
+            if retained_pct < 70:
+                log.warning(
+                    "VAD discarded >30%% of the clip — some speech may have been "
+                    "classified as silence.  Consider lowering vad_threshold_db in config."
+                )
 
         from .vocabulary import fix_missing_periods
 
