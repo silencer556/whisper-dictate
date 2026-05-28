@@ -1341,16 +1341,20 @@ class DictateGUI:
             model_changed = (new_model  != w.get("model",        "medium.en") or
                              new_device != w.get("device",        "cuda"))
 
-            cfg["output"]["method"]           = method
-            cfg["output"]["extension_port"]   = port
-            cfg["output"]["trailing_space"]   = trailing
-            cfg["output"]["keystroke_delay_ms"] = delay
-            cfg.setdefault("audio", {})["idle_stop_sec"] = idle_stop
-            cfg["audio"]["streaming_interval_sec"] = stream_interval
-            cfg.setdefault("whisper", {})["model"]        = new_model
-            cfg["whisper"]["device"]                      = new_device
-            cfg["whisper"]["compute_type"]                = new_compute
-            save_config(cfg, cfg_path)
+            # Re-read the config from disk before writing so that vocabulary
+            # entries (or any other changes) added while Settings was open are
+            # preserved and not overwritten by the stale in-memory copy.
+            save_cfg = load_config(cfg_path)
+            save_cfg["output"]["method"]             = method
+            save_cfg["output"]["extension_port"]     = port
+            save_cfg["output"]["trailing_space"]     = trailing
+            save_cfg["output"]["keystroke_delay_ms"] = delay
+            save_cfg.setdefault("audio", {})["idle_stop_sec"]        = idle_stop
+            save_cfg["audio"]["streaming_interval_sec"]               = stream_interval
+            save_cfg.setdefault("whisper", {})["model"]               = new_model
+            save_cfg["whisper"]["device"]                             = new_device
+            save_cfg["whisper"]["compute_type"]                       = new_compute
+            save_config(save_cfg, cfg_path)
 
             self._output_method      = method
             self._trailing_space     = trailing
