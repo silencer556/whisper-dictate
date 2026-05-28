@@ -88,25 +88,41 @@ async function poll() {
   // uses keystroke, not the extension.
   const crdTab = await focusedCrdTab();
 
-  let text;
+  let data;
   try {
     const resp = await fetch(
       `http://localhost:${serverPort}/pending?crd=${crdTab ? 1 : 0}`,
       { signal: AbortSignal.timeout(200) }
     );
     if (!resp.ok) return;
-    const data = await resp.json();
-    text = data.text;
+    data = await resp.json();
   } catch {
     return;
   }
-  if (!text || !crdTab) return;
 
-  await typeInTab(crdTab.id, text);
+  // Item dequeued from server — only act if CRD is still focused.
+  if (!crdTab) return;
+
+  if (data.hotkey) {
+    await executeHotkey(crdTab.id, data.hotkey);
+  } else if (data.text) {
+    await typeInTab(crdTab.id, data.text);
+  }
 }
 
 const SHIFT_DOWN = { type: 'keyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, modifiers: 8 };
 const SHIFT_UP   = { type: 'keyUp',   key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, modifiers: 0 };
+
+// Meta (Cmd) modifier for Mac shortcuts sent through CRD.
+// CRD maps the Windows Meta key to the Mac Cmd key on the remote side.
+const META_DOWN = { type: 'keyDown', key: 'Meta', code: 'MetaLeft', windowsVirtualKeyCode: 91, nativeVirtualKeyCode: 91, modifiers: 4 };
+const META_UP   = { type: 'keyUp',   key: 'Meta', code: 'MetaLeft', windowsVirtualKeyCode: 91, nativeVirtualKeyCode: 91, modifiers: 0 };
+
+// Supported hotkey names → key info (sent with Meta modifier = Mac Cmd)
+const HOTKEY_MAP = {
+  copy:  { key: 'c', vk: 67, code: 'KeyC' },
+  paste: { key: 'v', vk: 86, code: 'KeyV' },
+};
 
 async function dispatchChar(tabId, char) {
   const info = KEY_MAP[char];
@@ -136,6 +152,48 @@ async function dispatchChar(tabId, char) {
 
   if (needsShift) {
     await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', SHIFT_UP);
+  }
+}
+
+async function dispatchHotkey(tabId, hotkey) {
+  const info = HOTKEY_MAP[hotkey];
+  if (!info) return;
+
+  // Send Meta down, then the key, then Meta up.
+  // CRD translates Meta → Cmd on the connected Mac.
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', META_DOWN);
+  const evt = {
+    key: info.key,
+    code: info.code,
+    windowsVirtualKeyCode: info.vk,
+    nativeVirtualKeyCode: info.vk,
+    modifiers: 4,   // Meta
+    text: '',
+    unmodifiedText: info.key,
+  };
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', { ...evt, type: 'keyDown' });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', { ...evt, type: 'keyUp' });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', META_UP);
+}
+
+async function executeHotkey(tabId, hotkey) {
+  isTyping = true;
+  try {
+    if (tabId !== attachedTabId) {
+      if (attachedTabId !== null) {
+        try { await chrome.debugger.detach({ tabId: attachedTabId }); } catch {}
+        attachedTabId = null;
+      }
+      await chrome.debugger.attach({ tabId }, '1.3');
+      attachedTabId = tabId;
+    }
+    await dispatchHotkey(tabId, hotkey);
+  } catch (err) {
+    console.error('[Whisper Dictate] executeHotkey error:', err);
+  } finally {
+    try { await chrome.debugger.detach({ tabId }); } catch {}
+    attachedTabId = null;
+    isTyping = false;
   }
 }
 

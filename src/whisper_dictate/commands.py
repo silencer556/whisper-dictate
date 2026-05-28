@@ -25,6 +25,8 @@ _BUILT_IN: dict[str, str] = {
     "whisper scratch that": "delete_last",
     "whisper undo":         "undo",
     "whisper select all":   "select_all",
+    "whisper copy":         "copy",
+    "whisper paste":        "paste",
     "whisper cancel":       "cancel",
     "whisper stop":         "cancel",
     "whisper resend":       "resend",
@@ -120,6 +122,33 @@ def _chars_to_delete(text: str) -> int:
     return len(text)
 
 
+_HOTKEY_LOCALS = {
+    "copy":  "ctrl+c",
+    "paste": "ctrl+v",
+}
+
+
+def _send_hotkey(hotkey: str) -> None:
+    """Send copy/paste via the extension (CRD → Mac Cmd) or local keyboard (Ctrl).
+
+    When Chrome Remote Desktop is active the extension handles the keypress and
+    forwards it as Meta+key so the Mac receives Cmd+C / Cmd+V.  Otherwise we
+    fall back to a local keyboard.send() with the Windows Ctrl equivalent.
+    """
+    from . import ext_server
+    if ext_server.is_crd_active():
+        ext_server.enqueue_hotkey(hotkey)
+        log.debug("Hotkey %r → extension (CRD active)", hotkey)
+    else:
+        try:
+            import keyboard
+            combo = _HOTKEY_LOCALS[hotkey]
+            keyboard.send(combo)
+            log.debug("Hotkey %r → keyboard.send(%r)", hotkey, combo)
+        except Exception as exc:
+            log.warning("Hotkey %r via keyboard failed: %s", hotkey, exc)
+
+
 def run_action(action: str, last_typed: str,
                output_method: str, keystroke_delay_ms: int) -> None:
     """Execute a voice command action.  Called from the GUI transcription thread."""
@@ -160,6 +189,14 @@ def run_action(action: str, last_typed: str,
             log.info("Command: Ctrl+A")
         except Exception as exc:
             log.warning("Command: select_all failed: %s", exc)
+
+    elif action == "copy":
+        _send_hotkey("copy")
+        log.info("Command: Copy")
+
+    elif action == "paste":
+        _send_hotkey("paste")
+        log.info("Command: Paste")
 
     else:
         log.warning("Unknown command action: %r", action)

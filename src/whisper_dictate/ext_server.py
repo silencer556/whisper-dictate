@@ -1,12 +1,16 @@
 """
 Tiny HTTP server that lets the browser extension poll for transcribed text.
 
-GET /pending?crd=1  → {"text": "..."} or {"text": ""}
+GET /pending?crd=1  → {"text": "...", "hotkey": ""}
   ?crd=1  means the extension currently sees a remotedesktop.google.com tab.
   ?crd=0  means no CRD tab is open right now.
 
 The extension sends this flag on every 250 ms poll so Python always knows
 whether CRD is active without any extra round-trip.
+
+Queue items are {"text": "...", "hotkey": "..."}.  Using one queue keeps
+text output and hotkey actions strictly ordered — e.g. "Hello whisper copy"
+first types "Hello" then sends the copy shortcut, never out of order.
 """
 
 import json
@@ -19,7 +23,9 @@ from urllib.parse import urlparse, parse_qs
 
 log = logging.getLogger(__name__)
 
-_q: queue.Queue[str] = queue.Queue()
+# Each item is {"text": "...", "hotkey": "..."}.
+# Using one queue keeps text and hotkey actions strictly ordered.
+_q: queue.Queue[dict] = queue.Queue()
 _server: HTTPServer | None = None
 
 # Updated by the extension on every poll; used by is_crd_active().
@@ -29,7 +35,12 @@ _CRD_TIMEOUT_SEC = 1.5   # extension polls every 250 ms, so 1.5 s is generous
 
 def enqueue(text: str) -> None:
     """Called from the transcription thread to push text to the extension."""
-    _q.put(text)
+    _q.put({"text": text, "hotkey": ""})
+
+
+def enqueue_hotkey(hotkey: str) -> None:
+    """Push a hotkey action (e.g. 'copy', 'paste') to the extension queue."""
+    _q.put({"text": "", "hotkey": hotkey})
 
 
 def is_crd_active() -> bool:
@@ -52,11 +63,11 @@ class _Handler(BaseHTTPRequestHandler):
             _crd_last_seen = time.monotonic()
 
         try:
-            text = _q.get_nowait()
+            item = _q.get_nowait()
         except queue.Empty:
-            text = ""
+            item = {"text": "", "hotkey": ""}
 
-        body = json.dumps({"text": text}).encode()
+        body = json.dumps(item).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
