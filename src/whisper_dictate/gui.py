@@ -913,11 +913,36 @@ class DictateGUI:
         self._conf_text.config(state=tk.DISABLED)
 
     def _show_vocab_add(self, heard: str, prob: float):
-        """Pop up a dialog to add *heard* → replacement to the vocabulary config."""
-        from .config import load_config, save_config, get_config_path
+        """Pop up the add/edit dialog pre-filled with a low-confidence word."""
+        self._show_vocab_entry(
+            parent=self.root,
+            heard_init=heard,
+            replace_init=heard.title(),
+            section_init="names",
+            subtitle=f'Whisper heard "{heard}"  ({prob:.0%} confidence)',
+        )
 
-        win = tk.Toplevel(self.root)
-        win.title("Add to vocabulary")
+    # ------------------------------------------------------------------
+    # Vocabulary manager + add/edit dialog
+    # ------------------------------------------------------------------
+
+    def _show_vocab_entry(self, parent, heard_init: str = "", replace_init: str = "",
+                          section_init: str = "names", subtitle: str = "",
+                          delete_heard: str = "", delete_section: str = "",
+                          on_done=None):
+        """Add or edit a single vocabulary entry.
+
+        heard_init / replace_init — pre-filled values.
+        delete_heard / delete_section — if set, that key is removed before saving
+        (used for in-place edits where the heard phrase may change).
+        on_done — callback fired after a successful save (e.g. to refresh a list).
+        """
+        from .config import load_config, save_config, get_config_path
+        cfg_path = self._config_path or get_config_path()
+
+        is_edit = bool(delete_heard)
+        win = tk.Toplevel(parent)
+        win.title("Edit vocabulary entry" if is_edit else "Add vocabulary entry")
         win.resizable(False, False)
         win.attributes("-topmost", True)
         win.configure(bg=_D["bg"])
@@ -926,66 +951,205 @@ class DictateGUI:
         f = tk.Frame(win, padx=18, pady=14, bg=_D["bg"])
         f.pack()
 
-        def _lbl(text, **kw):
-            return tk.Label(f, text=text, bg=_D["bg"], fg=_D["fg"], **kw)
+        def _lbl(text, r, col=0, **kw):
+            tk.Label(f, text=text, bg=_D["bg"], fg=_D["fg"],
+                     font=("Segoe UI", 9), anchor="w", **kw).grid(
+                row=r, column=col, sticky="w", pady=4, padx=(0, 12 if col == 0 else 0))
 
-        _lbl("Whisper heard:", font=("Segoe UI", 9), anchor="w").grid(
-            row=0, column=0, sticky="w", pady=4)
-        _lbl(f'"{heard}"  ({prob:.0%} confidence)',
-             font=("Segoe UI", 9, "italic"), fg=_D["orange"]).grid(
-            row=0, column=1, sticky="w", padx=(10, 0))
-
-        _lbl("Replace with:", font=("Segoe UI", 9), anchor="w").grid(
-            row=1, column=0, sticky="w", pady=4)
-        replace_var = tk.StringVar(value=heard.title())
-        entry = tk.Entry(f, textvariable=replace_var, width=28, font=("Segoe UI", 10),
+        def _entry_widget(var, r):
+            e = tk.Entry(f, textvariable=var, width=34, font=("Segoe UI", 10),
                          bg=_D["bg_input"], fg=_D["fg"], insertbackground=_D["fg"],
                          relief=tk.FLAT, highlightthickness=1,
                          highlightbackground=_D["bg_btn"])
-        entry.grid(row=1, column=1, sticky="w", padx=(10, 0))
-        entry.selection_range(0, tk.END)
-        entry.focus_set()
+            e.grid(row=r, column=1, sticky="w")
+            return e
 
-        _lbl("Section:", font=("Segoe UI", 9), anchor="w").grid(
-            row=2, column=0, sticky="w", pady=4)
-        section_var = tk.StringVar(value="terminology")
-        om = tk.OptionMenu(f, section_var, "terminology", "names", "unique", "punctuation")
+        row = 0
+        if subtitle:
+            tk.Label(f, text=subtitle, font=("Segoe UI", 9, "italic"),
+                     fg=_D["orange"], bg=_D["bg"]).grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            row += 1
+
+        _lbl("When Whisper says:", row)
+        heard_var = tk.StringVar(value=heard_init)
+        heard_entry = _entry_widget(heard_var, row)
+        row += 1
+
+        _lbl("Type instead:", row)
+        replace_var = tk.StringVar(value=replace_init)
+        replace_entry = _entry_widget(replace_var, row)
+        row += 1
+
+        _lbl("Section:", row)
+        section_var = tk.StringVar(value=section_init)
+        om = tk.OptionMenu(f, section_var, "names", "terminology", "unique", "punctuation")
         om.config(bg=_D["bg_btn"], fg=_D["fg"], relief=tk.FLAT, highlightthickness=0,
                   activebackground=_D["bg_btn_act"], activeforeground=_D["fg"])
         om["menu"].config(bg=_D["bg2"], fg=_D["fg"],
                           activebackground=_D["accent"], activeforeground="white")
-        om.grid(row=2, column=1, sticky="w", padx=(10, 0))
-        _lbl("terminology = jargon/acronyms  |  names = people/places",
-             font=("Segoe UI", 7), fg=_D["fg_hint"]).grid(
-            row=3, column=0, columnspan=2, sticky="w")
+        om.grid(row=row, column=1, sticky="w")
+        row += 1
+
+        tk.Label(f,
+                 text="names = people/places  ·  terminology = jargon  ·  unique = multi-word / @ symbols",
+                 font=("Segoe UI", 7), fg=_D["fg_hint"], bg=_D["bg"]).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        row += 1
+
+        # Focus the first empty field
+        if not heard_init:
+            heard_entry.focus_set()
+        else:
+            replace_entry.focus_set()
+            replace_entry.selection_range(0, tk.END)
 
         def on_save():
+            heard = heard_var.get().strip().lower()
             replacement = replace_var.get().strip()
-            if not replacement:
-                return
             section = section_var.get()
-            cfg_path = self._config_path or get_config_path()
+            if not heard or not replacement:
+                return
+
             cfg = load_config(cfg_path)
-            cfg["vocabulary"].setdefault(section, {})[heard.lower()] = replacement
+            vocab = cfg.setdefault("vocabulary", {})
+
+            # Remove old key if we're editing (the heard phrase may have changed)
+            if delete_heard and delete_section:
+                vocab.get(delete_section, {}).pop(delete_heard.lower(), None)
+                self._vocab.get(delete_section, {}).pop(delete_heard.lower(), None)
+
+            vocab.setdefault(section, {})[heard] = replacement
             save_config(cfg, cfg_path)
-            # Apply immediately to the running instance
-            self._vocab.setdefault(section, {})[heard.lower()] = replacement
-            log.info("Vocabulary: '%s' -> '%s' added to [%s]", heard, replacement, section)
+            self._vocab.setdefault(section, {})[heard] = replacement
+            log.info("Vocabulary: '%s' -> '%s' [%s]", heard, replacement, section)
             win.destroy()
+            if on_done:
+                on_done()
 
         btn_f = tk.Frame(win, pady=8, bg=_D["bg"])
         btn_f.pack()
 
-        def _dbtn(text, cmd, **kw):
+        def _btn(text, cmd):
             return tk.Button(btn_f, text=text, command=cmd, width=10,
+                             bg=_D["bg_btn"], fg=_D["fg"],
+                             activebackground=_D["bg_btn_act"], activeforeground=_D["fg"],
+                             relief=tk.FLAT, bd=0)
+
+        _btn("Cancel", win.destroy).pack(side="left", padx=4)
+        _btn("Save", on_save).pack(side="left", padx=4)
+        win.bind("<Return>", lambda e: on_save())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def _show_vocab_manager(self):
+        """Full vocabulary manager: list all entries, add / edit / delete."""
+        from .config import load_config, save_config, get_config_path
+        cfg_path = self._config_path or get_config_path()
+
+        win = tk.Toplevel(self.root)
+        win.title("Vocabulary")
+        win.resizable(True, True)
+        win.attributes("-topmost", True)
+        win.configure(bg=_D["bg"])
+        win.grab_set()
+        win.geometry("560x360")
+
+        # ── Treeview ──────────────────────────────────────────────────
+        tree_frame = tk.Frame(win, bg=_D["bg"], padx=12, pady=(10, 0))
+        tree_frame.pack(fill="both", expand=True)
+
+        cols = ("section", "heard", "replacement")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
+                            selectmode="browse", height=13)
+        tree.heading("section",     text="Section",            anchor="w")
+        tree.heading("heard",       text="When Whisper says",  anchor="w")
+        tree.heading("replacement", text="Type instead",       anchor="w")
+        tree.column("section",     width=90,  minwidth=70,  anchor="w")
+        tree.column("heard",       width=200, minwidth=100, anchor="w")
+        tree.column("replacement", width=200, minwidth=100, anchor="w")
+
+        _ts = ttk.Style()
+        _ts.configure("Vocab.Treeview",
+                       background=_D["bg2"], fieldbackground=_D["bg2"],
+                       foreground=_D["fg"], rowheight=22, borderwidth=0)
+        _ts.configure("Vocab.Treeview.Heading",
+                       background=_D["bg_btn"], foreground=_D["fg_dim"],
+                       relief="flat")
+        _ts.map("Vocab.Treeview",
+                background=[("selected", _D["accent"])],
+                foreground=[("selected", "white")])
+        tree.configure(style="Vocab.Treeview")
+
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        # ── Populate ──────────────────────────────────────────────────
+        _SECTION_ORDER = ["unique", "names", "terminology", "punctuation"]
+
+        def _reload():
+            tree.delete(*tree.get_children())
+            cfg = load_config(cfg_path)
+            vocab = cfg.get("vocabulary", {})
+            for sec in _SECTION_ORDER:
+                entries = vocab.get(sec, {})
+                if isinstance(entries, dict):
+                    for heard_key, repl in sorted(entries.items()):
+                        tree.insert("", "end", values=(sec, heard_key, repl))
+
+        _reload()
+
+        # ── Buttons ───────────────────────────────────────────────────
+        btn_frame = tk.Frame(win, bg=_D["bg"], pady=8, padx=12)
+        btn_frame.pack(fill="x")
+
+        def _btn(parent, text, cmd, **kw):
+            return tk.Button(parent, text=text, command=cmd, width=10,
                              bg=_D["bg_btn"], fg=_D["fg"],
                              activebackground=_D["bg_btn_act"], activeforeground=_D["fg"],
                              relief=tk.FLAT, bd=0, **kw)
 
-        _dbtn("Cancel", win.destroy).pack(side="left", padx=4)
-        _dbtn("Add", on_save).pack(side="left", padx=4)
-        win.bind("<Return>", lambda e: on_save())
-        win.bind("<Escape>", lambda e: win.destroy())
+        def on_add():
+            self._show_vocab_entry(win, on_done=_reload)
+
+        def on_edit():
+            sel = tree.selection()
+            if not sel:
+                return
+            sec, heard_key, repl = tree.item(sel[0], "values")
+            self._show_vocab_entry(win,
+                                   heard_init=heard_key,
+                                   replace_init=repl,
+                                   section_init=sec,
+                                   delete_heard=heard_key,
+                                   delete_section=sec,
+                                   on_done=_reload)
+
+        def on_delete():
+            sel = tree.selection()
+            if not sel:
+                return
+            sec, heard_key, _ = tree.item(sel[0], "values")
+            cfg = load_config(cfg_path)
+            cfg.get("vocabulary", {}).get(sec, {}).pop(heard_key, None)
+            save_config(cfg, cfg_path)
+            self._vocab.get(sec, {}).pop(heard_key, None)
+            log.info("Vocabulary: deleted '%s' from [%s]", heard_key, sec)
+            _reload()
+
+        tree.bind("<Double-1>", lambda _e: on_edit())
+        tree.bind("<Delete>",   lambda _e: on_delete())
+
+        _btn(btn_frame, "+ Add",   on_add).pack(side="left", padx=(0, 4))
+        _btn(btn_frame, "Edit",    on_edit).pack(side="left", padx=4)
+        _btn(btn_frame, "Delete",  on_delete).pack(side="left", padx=4)
+        _btn(btn_frame, "Close",   win.destroy).pack(side="right", padx=(4, 0))
+
+        tk.Label(btn_frame,
+                 text="Double-click a row to edit  ·  Delete key removes selected",
+                 font=("Segoe UI", 7), fg=_D["fg_hint"], bg=_D["bg"]).pack(
+            side="left", padx=8)
 
     # ------------------------------------------------------------------
     # Settings dialog
@@ -1080,19 +1244,38 @@ class DictateGUI:
         dark_entry(stream_var, width=8).grid(row=5, column=1, sticky="w")
         hint("  type progressively while speaking  (0 = off;  3–5 = recommended)", 5)
 
-        # ── Section divider ───────────────────────────────────────────
-        tk.Label(f, text="  Whisper model", font=("Segoe UI", 8, "bold"),
+        # ── Vocabulary section ────────────────────────────────────────
+        tk.Label(f, text="  Vocabulary", font=("Segoe UI", 8, "bold"),
                  bg=_D["bg"], fg=_D["fg_dim"]).grid(
             row=6, column=0, columnspan=3, sticky="w", pady=(12, 2))
         tk.Frame(f, bg=_D["bg_btn"], height=1).grid(
             row=7, column=0, columnspan=3, sticky="ew", pady=(0, 6))
 
+        def open_vocab_manager():
+            win.grab_release()
+            self._show_vocab_manager()
+
+        tk.Button(f, text="Manage Vocabulary…",
+                  command=open_vocab_manager,
+                  bg=_D["bg_btn"], fg=_D["fg"],
+                  activebackground=_D["bg_btn_act"], activeforeground=_D["fg"],
+                  relief=tk.FLAT, bd=0, padx=10).grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        hint("  add names, phrases, @ symbols, or any custom substitution", 8)
+
+        # ── Section divider ───────────────────────────────────────────
+        tk.Label(f, text="  Whisper model", font=("Segoe UI", 8, "bold"),
+                 bg=_D["bg"], fg=_D["fg_dim"]).grid(
+            row=9, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        tk.Frame(f, bg=_D["bg_btn"], height=1).grid(
+            row=10, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
         # ── Model selector ────────────────────────────────────────────
-        row("Model:", 8)
+        row("Model:", 11)
         current_model = w.get("model", "medium.en")
         model_var = tk.StringVar(value=current_model)
-        dark_om(model_var, *MODEL_OPTIONS).grid(row=8, column=1, sticky="w")
-        model_hint = hint_lbl(8)
+        dark_om(model_var, *MODEL_OPTIONS).grid(row=11, column=1, sticky="w")
+        model_hint = hint_lbl(11)
 
         def _update_model_hint(*_):
             m = model_var.get()
@@ -1107,7 +1290,7 @@ class DictateGUI:
         _update_model_hint()   # set initial state
 
         # ── Device selector ───────────────────────────────────────────
-        row("Device:", 9)
+        row("Device:", 12)
         _DEVICE_LABELS = {"cuda": "GPU (CUDA)", "cpu": "CPU"}
         _DEVICE_VALUES = {"GPU (CUDA)": "cuda", "CPU": "cpu"}
         current_device = w.get("device", "cuda")
@@ -1115,16 +1298,16 @@ class DictateGUI:
             value=_DEVICE_LABELS.get(current_device, "GPU (CUDA)"))
 
         device_om = dark_om(device_label_var, "GPU (CUDA)", "CPU")
-        device_om.grid(row=9, column=1, sticky="w")
+        device_om.grid(row=12, column=1, sticky="w")
 
         if not _cuda_ok:
             # Show GPU option but grayed out so users know it exists
             device_om["menu"].entryconfig(0, state="disabled",
                                           foreground=_D["fg_hint"])
             device_label_var.set("CPU")
-            hint("  no CUDA GPU detected — install nvidia-cublas-cu12 to enable", 9)
+            hint("  no CUDA GPU detected — install nvidia-cublas-cu12 to enable", 12)
         else:
-            hint("  GPU is ~10–40× faster than CPU for transcription", 9)
+            hint("  GPU is ~10–40× faster than CPU for transcription", 12)
 
         # ── Save / Cancel ─────────────────────────────────────────────
         def on_save():
