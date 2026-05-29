@@ -841,7 +841,19 @@ class DictateGUI:
 
         if tail_audio is not None and len(tail_audio) > 0:
             try:
-                self._transcriber.transcribe(tail_audio, self._sample_rate, on_segment=on_segment)
+                # Pass whatever streaming already typed as the initial_prompt for
+                # the tail pass.  Without this Whisper treats the tail as the start
+                # of a new sentence — wrong capitalisation, wrong punctuation — even
+                # though it's the continuation of mid-sentence speech.
+                tail_prompt = (
+                    ((self._transcriber._initial_prompt or "") + " " + stream_typed).strip()
+                    if stream_typed else None
+                )
+                self._transcriber.transcribe(
+                    tail_audio, self._sample_rate,
+                    on_segment=on_segment,
+                    initial_prompt_override=tail_prompt,
+                )
             except Exception as exc:
                 log.error("Transcription failed: %s", exc)
                 self.root.after(0, lambda: self._set_state("idle", transcription=f"[Error: {exc}]"))

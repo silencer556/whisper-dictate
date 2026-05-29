@@ -286,6 +286,10 @@ class Transcriber:
         # no_speech_threshold is raised from the default 0.6 → 0.9 so that
         # Whisper only suppresses a segment when it is extremely confident there
         # is no speech — further guarding against mid-sentence dropouts.
+        # beam_size=1 (greedy decoding) is 3–5× faster than the default beam_size=5
+        # with negligible quality loss for continuous dictation.  The extra beam
+        # passes help most with ambiguous audio; fluent speech at normal pace
+        # transcribes equally well with greedy decoding at a fraction of the cost.
         segments, info = self._model.transcribe(
             audio,
             language="en",
@@ -293,9 +297,10 @@ class Transcriber:
             vad_filter=False,
             no_speech_threshold=0.9,
             word_timestamps=True,
+            beam_size=1,
         )
 
-        log.info("Transcribing %.2fs clip (vad_filter=off, no_speech_threshold=0.9)", duration)
+        log.info("Transcribing %.2fs clip (beam_size=1, vad_filter=off)", duration)
 
         from .vocabulary import fix_missing_periods
 
