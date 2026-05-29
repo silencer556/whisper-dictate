@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import threading
 import time
 import logging
@@ -9,6 +12,23 @@ from .output import type_text
 
 
 log = logging.getLogger(__name__)
+
+
+def _restart_app() -> None:
+    """Spawn a fresh copy of this process, then exit immediately.
+
+    Used after a model change so the new model loads in a clean process with
+    a fresh CUDA context.  The config is already saved to disk before this is
+    called, so the new instance just reads the updated settings and starts up.
+
+    sys.argv[1:] preserves --gui, --config, --verbose, etc.
+    """
+    try:
+        subprocess.Popen([sys.executable, "-m", "whisper_dictate"] + sys.argv[1:])
+    except Exception as exc:
+        log.error("Restart failed: %s — please restart manually", exc)
+        return
+    os._exit(0)  # immediate exit; skip atexit to avoid interfering with new process
 
 _COLORS = {
     "idle":         "#888888",
@@ -1374,21 +1394,18 @@ class DictateGUI:
             if method in ("extension", "auto"):
                 _ext.start(port)
 
-            if model_changed:
-                log.info("Model changed to %s on %s — reloading", new_model, new_device)
-                _threading.Thread(
-                    target=lambda: self._transcriber.reload(
-                        model_name=new_model,
-                        device=new_device,
-                        compute_type=new_compute,
-                        on_status=self._on_model_status,
-                        on_progress=self._on_progress,
-                    ),
-                    daemon=True,
-                ).start()
-
             log.info("Settings saved: method=%s model=%s device=%s", method, new_model, new_device)
             win.destroy()
+
+            if model_changed:
+                # Restart the whole process so the new model loads in a clean
+                # environment.  In-process reload is unreliable: ctranslate2
+                # holds CUDA resources that aren't freed until the old model
+                # object is GC'd, and _run_transcribe() uses self._model
+                # outside the lock, so a concurrent reload causes crashes.
+                # The config is already on disk; the new process just reads it.
+                log.info("Model changed to %s on %s — restarting", new_model, new_device)
+                self._root.after(150, _restart_app)
 
         btn_f = tk.Frame(win, pady=8, bg=_D["bg"])
         btn_f.pack()
