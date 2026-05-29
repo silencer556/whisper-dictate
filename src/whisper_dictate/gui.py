@@ -482,6 +482,13 @@ class DictateGUI:
 
     def _set_state(self, state: str, transcription: str | None = None):
         """Must be called from the tkinter main thread."""
+        # Defensive: leaving recording state should always kill the stream timer.
+        # _end_recording normally handles this, but belt-and-suspenders here so
+        # any future code path that calls _set_state directly can't leave a
+        # dangling timer thread.
+        if state != "recording" and self._stream_timer is not None:
+            self._stream_timer.cancel()
+            self._stream_timer = None
         self._state = state
         color = _COLORS.get(state, "#888888")
         self._canvas.itemconfig(self._dot, fill=color)

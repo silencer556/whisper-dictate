@@ -228,9 +228,16 @@ async function typeInTab(tabId, text) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabId === attachedTabId) attachedTabId = null;
 });
+// Debounce the onUpdated handler: a tab can fire multiple loading events in
+// rapid succession (e.g. SPA navigation).  Only act once per navigation
+// burst so we don't queue up overlapping detach calls.
+let _detachPending = false;
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (tabId === attachedTabId && changeInfo.status === 'loading') {
-    chrome.debugger.detach({ tabId }).catch(() => {});
+  if (tabId === attachedTabId && changeInfo.status === 'loading' && !_detachPending) {
+    _detachPending = true;
+    chrome.debugger.detach({ tabId }).catch(() => {}).finally(() => {
+      _detachPending = false;
+    });
     attachedTabId = null;
   }
 });
