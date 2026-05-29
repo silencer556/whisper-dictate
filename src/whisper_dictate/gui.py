@@ -280,6 +280,13 @@ class DictateGUI:
         ).pack(side="left")
 
         tk.Button(
+            btn_row, text="?", command=self._show_commands,
+            font=("Segoe UI", 9), relief=tk.FLAT, bd=0,
+            bg=_D["bg"], fg=_D["fg_dim"],
+            activebackground=_D["bg_btn"], activeforeground=_D["fg"],
+        ).pack(side="left", padx=(6, 0))
+
+        tk.Button(
             btn_row, text="⊟", command=self._toggle_compact,
             font=("Segoe UI", 9), relief=tk.FLAT, bd=0,
             bg=_D["bg"], fg=_D["fg_dim"],
@@ -1189,6 +1196,85 @@ class DictateGUI:
                  text="Double-click a row to edit  ·  Delete key removes selected",
                  font=("Segoe UI", 7), fg=_D["fg_hint"], bg=_D["bg"]).pack(
             side="left", padx=8)
+
+    # ------------------------------------------------------------------
+    # Voice commands reference dialog
+    # ------------------------------------------------------------------
+
+    def _show_commands(self):
+        win = tk.Toplevel(self.root)
+        win.title("Voice Commands")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.configure(bg=_D["bg"])
+        win.bind("<Escape>", lambda _: win.destroy())
+
+        # ── Header ────────────────────────────────────────────────────
+        tk.Label(win, text="Voice Commands",
+                 font=("Segoe UI", 12, "bold"),
+                 bg=_D["bg"], fg=_D["fg"]).pack(pady=(14, 2), padx=20)
+        tk.Label(win,
+                 text="Say a command (alone or at the end of a sentence).\n"
+                      "Example: \"see you later whisper enter\"",
+                 font=("Segoe UI", 8), bg=_D["bg"], fg=_D["fg_dim"],
+                 justify="center").pack(padx=20, pady=(0, 10))
+
+        # ── Table ─────────────────────────────────────────────────────
+        _COMMANDS = [
+            ("Editing", [
+                ('"whisper enter"  /  "whisper new line"', "Press Enter"),
+                ('"whisper tab"',                          "Press Tab"),
+                ('"whisper delete that"  /  "whisper scratch that"',
+                                                           "Delete last clause"),
+                ('"whisper undo"',                         "Undo  (Ctrl+Z)"),
+                ('"whisper select all"',                   "Select all  (Ctrl+A)"),
+            ]),
+            ("Clipboard", [
+                ('"whisper copy"',  "Copy   (Ctrl+C,  or Cmd+C via Remote Desktop)"),
+                ('"whisper paste"', "Paste  (Ctrl+V,  or Cmd+V via Remote Desktop)"),
+            ]),
+            ("Session", [
+                ('"whisper cancel"  /  "whisper stop"', "Discard current recording"),
+                ('"whisper resend"',                    "Re-type last transcription"),
+            ]),
+        ]
+
+        tbl = tk.Frame(win, bg=_D["bg"])
+        tbl.pack(fill="x", padx=20, pady=(0, 6))
+
+        row_idx = 0
+        for section, entries in _COMMANDS:
+            # Section header
+            tk.Label(tbl, text=section,
+                     font=("Segoe UI", 9, "bold"),
+                     bg=_D["bg"], fg=_D["orange"],
+                     anchor="w").grid(row=row_idx, column=0, columnspan=2,
+                                      sticky="w", pady=(10, 2))
+            row_idx += 1
+
+            for phrase, action in entries:
+                bg = _D["bg2"] if row_idx % 2 == 0 else _D["bg"]
+                tk.Label(tbl, text=phrase,
+                         font=("Segoe UI", 9),
+                         bg=bg, fg=_D["fg"],
+                         anchor="w", padx=6, pady=3).grid(
+                    row=row_idx, column=0, sticky="ew", padx=(0, 8))
+                tk.Label(tbl, text=action,
+                         font=("Segoe UI", 9),
+                         bg=bg, fg=_D["fg_dim"],
+                         anchor="w", padx=6, pady=3).grid(
+                    row=row_idx, column=1, sticky="ew")
+                row_idx += 1
+
+        tbl.columnconfigure(0, weight=1)
+        tbl.columnconfigure(1, weight=1)
+
+        # ── Close button ──────────────────────────────────────────────
+        tk.Button(win, text="Close", command=win.destroy,
+                  font=("Segoe UI", 9), width=10,
+                  bg=_D["bg_btn"], fg=_D["fg"],
+                  activebackground=_D["bg_btn_act"], activeforeground=_D["fg"],
+                  relief=tk.FLAT, bd=0).pack(pady=(6, 14))
 
     # ------------------------------------------------------------------
     # Settings dialog
