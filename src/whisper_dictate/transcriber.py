@@ -166,15 +166,40 @@ class Transcriber:
             self._model = WhisperModel(self._model_name, device=device, compute_type=compute_type)
         except Exception as exc:
             if device == "cuda":
-                log.warning("CUDA load failed (%s) — falling back to CPU/int8", exc)
-                try:
-                    self._model = WhisperModel(self._model_name, device="cpu", compute_type="int8")
-                    self._device = "cpu"
-                    self._compute_type = "int8"
-                except Exception as exc2:
-                    log.error("CPU fallback also failed: %s", exc2)
-                    self._load_failed = True
-                    return
+                # Initial CUDA load failed — most likely insufficient VRAM for the
+                # requested compute type (float16 needs ~2× the VRAM of int8_float16).
+                # Try int8_float16 next: quantized weights, half the VRAM, still on GPU.
+                if compute_type != "int8_float16":
+                    log.warning(
+                        "CUDA %s load failed (%s) — retrying with int8_float16 (uses less VRAM)",
+                        compute_type, exc,
+                    )
+                    try:
+                        self._model = WhisperModel(self._model_name, device="cuda", compute_type="int8_float16")
+                        self._compute_type = "int8_float16"
+                        log.info("Loaded on CUDA with int8_float16 (reduced VRAM mode)")
+                    except Exception as exc2:
+                        log.warning("CUDA int8_float16 also failed (%s) — falling back to CPU/int8", exc2)
+                        try:
+                            self._model = WhisperModel(self._model_name, device="cpu", compute_type="int8")
+                            self._device = "cpu"
+                            self._compute_type = "int8"
+                            log.warning("Running on CPU/int8 — transcription will be slow for large models")
+                        except Exception as exc3:
+                            log.error("CPU fallback also failed: %s", exc3)
+                            self._load_failed = True
+                            return
+                else:
+                    log.warning("CUDA int8_float16 load failed (%s) — falling back to CPU/int8", exc)
+                    try:
+                        self._model = WhisperModel(self._model_name, device="cpu", compute_type="int8")
+                        self._device = "cpu"
+                        self._compute_type = "int8"
+                        log.warning("Running on CPU/int8 — transcription will be slow for large models")
+                    except Exception as exc2:
+                        log.error("CPU fallback also failed: %s", exc2)
+                        self._load_failed = True
+                        return
             else:
                 log.error("Failed to load model: %s", exc)
                 self._load_failed = True

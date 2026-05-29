@@ -1336,7 +1336,16 @@ class DictateGUI:
 
             new_model  = model_var.get()
             new_device = _DEVICE_VALUES.get(device_label_var.get(), "cuda")
-            new_compute = "float16" if new_device == "cuda" else "int8"
+            # Preserve the stored compute_type when staying on CUDA so a previous
+            # runtime fallback (e.g. float16→int8_float16 due to low VRAM) isn't
+            # silently reset every time the user opens Settings.
+            # When switching to CPU always use int8; when switching to CUDA fresh
+            # start with int8_float16 (works on 4 GB+ cards, vs float16 needing ~6 GB).
+            if new_device == "cuda":
+                current = w.get("compute_type", "")
+                new_compute = current if current in ("float16", "int8_float16", "int8") else "int8_float16"
+            else:
+                new_compute = "int8"
 
             model_changed = (new_model  != w.get("model",        "medium.en") or
                              new_device != w.get("device",        "cuda"))

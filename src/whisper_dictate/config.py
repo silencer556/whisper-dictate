@@ -9,7 +9,7 @@ log = logging.getLogger(__name__)
 
 VALID_MODELS = {"tiny.en", "base.en", "small.en", "medium.en", "large-v2", "large-v3"}
 VALID_DEVICES = {"cuda", "cpu"}
-VALID_COMPUTE = {"float16", "int8", "float32"}
+VALID_COMPUTE = {"float16", "int8_float16", "int8", "float32"}
 VALID_MODES = {"push_to_talk", "toggle"}
 VALID_OUTPUT_METHODS = {"auto", "keystroke", "clipboard", "extension", "remote"}
 
